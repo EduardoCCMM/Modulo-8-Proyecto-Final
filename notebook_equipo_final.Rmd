@@ -1,0 +1,1221 @@
+---
+title: "Patrones de utilización del sistema ECOBICI (CDMX)"
+author: "Equipo 9"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+subtitle: 'Proyecto Final — Módulo 8: Comunicación de resultados'
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+options(scipen = 999)
+
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(stringr)
+library(scales)
+library(cluster)
+library(factoextra)
+library(tidyr)
+library(broom)
+
+theme_set(theme_minimal(base_size = 12))
+
+niveles_dias <- c(
+  "lunes", "martes", "miércoles", "jueves",
+  "viernes", "sábado", "domingo"
+)
+
+meses_es <- c(
+  "enero", "febrero", "marzo", "abril", "mayo", "junio",
+  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+)
+```
+
+# Pregunta inicial
+
+> **¿Cómo varía la demanda de ECOBICI por estación y hora del día entre
+> enero y diciembre de 2025, y pueden agruparse las estaciones en
+> perfiles de uso similares que ayuden a identificar periodos de mayor
+> presión operativa?**
+
+Como preguntas secundarias se analizan el desbalance entre retiros y
+arribos por estación, las diferencias territoriales por alcaldía, la
+estacionalidad mensual y algunas características demográficas de los
+usuarios.
+
+**Hipótesis.** La demanda de ECOBICI no se distribuye de manera
+homogénea entre estaciones ni a lo largo del día. Se espera identificar
+grupos de estaciones con perfiles horarios diferenciados, lo que
+permitiría reconocer patrones de movilidad recurrentes y periodos en los
+que la operación enfrenta una mayor presión de retiros o arribos.
+
+**Variable objetivo.** Número de viajes por estación y hora. Para el
+clustering se utiliza el perfil horario normalizado de cada estación, es
+decir, la proporción de sus retiros que ocurre en cada hora del día.
+
+**Variables explicativas y de segmentación.** Hora de retiro, día de la
+semana, tipo de día, mes, estación, alcaldía y colonia. Edad y género se
+consideran únicamente para la descripción de la población usuaria.
+
+**Población de interés.** Viajes registrados por el sistema ECOBICI en
+la Ciudad de México durante 2025.
+
+**Unidad de análisis.** El viaje individual constituye el registro de
+origen; para el análisis de demanda y el modelado se emplean
+agregaciones por estación y hora.
+
+**Alcance temporal.** Enero-diciembre de 2025.
+
+**Alcance geográfico.** Estaciones incluidas en el catálogo utilizado
+para el sistema ECOBICI.
+
+# 1. Datos y contexto
+
+Se utilizaron los doce archivos mensuales de viajes de 2025 y el
+catálogo de estaciones con información de colonia, alcaldía y
+coordenadas. Se eligió un año calendario completo para observar patrones
+horarios, semanales y mensuales sin mezclar periodos con posibles
+diferencias de captura entre años.
+
+El archivo `.Rmd`, los doce archivos CSV y el catálogo deben mantenerse
+en la misma carpeta. La ruta relativa facilita que el análisis pueda
+reproducirse en otra computadora sin modificar una dirección personal.
+
+**Carga de datos**
+
+```{r cargar-datos}
+ruta_datos_crudos <- "."
+archivo_catalogo   <- file.path(ruta_datos_crudos, "Catálogo Ecobici.csv")
+carpeta_salida     <- file.path(ruta_datos_crudos, "output")
+archivo_raw_cache  <- file.path(carpeta_salida, "ECOBICI_RAW_202501_202512.rds")
+
+# Validación de archivos de entrada
+archivos <- file.path(ruta_datos_crudos, sprintf("2025-%02d.csv", 1:12))
+faltantes <- archivos[!file.exists(archivos)]
+
+if (length(faltantes) > 0) {
+  stop(
+    "No se encontraron todos los CSV mensuales. Faltan: ",
+    paste(basename(faltantes), collapse = ", ")
+  )
+}
+
+if (!file.exists(archivo_catalogo)) {
+  stop("No se encontró el catálogo: ", archivo_catalogo)
+}
+
+dir.create(carpeta_salida, showWarnings = FALSE, recursive = TRUE)
+
+# Reutilización del caché cuando sigue vigente
+usar_cache <- FALSE
+
+if (file.exists(archivo_raw_cache)) {
+  cache_tmp <- tryCatch(readRDS(archivo_raw_cache), error = function(e) NULL)
+
+  cache_valido <- !is.null(cache_tmp) &&
+    inherits(cache_tmp, c("data.frame", "data.table")) &&
+    nrow(cache_tmp) > 0 && ncol(cache_tmp) > 0
+
+  if (cache_valido) {
+    fecha_cache <- file.info(archivo_raw_cache)$mtime
+    fecha_csv   <- max(file.info(archivos)$mtime, na.rm = TRUE)
+
+    if (!is.na(fecha_cache) && fecha_cache >= fecha_csv) {
+      viajes_raw <- as.data.table(cache_tmp)
+      usar_cache <- TRUE
+    }
+  }
+}
+
+if (!usar_cache) {
+  lista_viajes <- lapply(archivos, function(archivo) {
+    fread(
+      archivo,
+      encoding = "UTF-8",
+      colClasses = "character",
+      showProgress = FALSE
+    )
+  })
+
+  viajes_raw <- rbindlist(lista_viajes, use.names = TRUE, fill = TRUE)
+
+  if (nrow(viajes_raw) == 0 || ncol(viajes_raw) == 0) {
+    stop("Los archivos fueron encontrados, pero no se cargaron registros.")
+  }
+
+  saveRDS(viajes_raw, archivo_raw_cache)
+}
+
+# Variables requeridas en el análisis
+columnas_necesarias <- c(
+  "Edad_Usuario", "Bici", "Fecha_Retiro", "Hora_Retiro",
+  "Fecha_Arribo", "Hora_Arribo", "Genero_Usuario",
+  "Ciclo_Estacion_Retiro", "Ciclo_EstacionArribo"
+)
+
+columnas_faltantes <- setdiff(columnas_necesarias, names(viajes_raw))
+
+if (length(columnas_faltantes) > 0) {
+  stop(
+    "Faltan columnas necesarias: ",
+    paste(columnas_faltantes, collapse = ", ")
+  )
+}
+
+catalogo <- fread(archivo_catalogo, encoding = "UTF-8")
+
+cat("Archivos mensuales encontrados:", length(archivos), "\n")
+cat("Registros cargados:", format(nrow(viajes_raw), big.mark = ","), "\n")
+cat("Variables:", ncol(viajes_raw), "\n")
+cat("Estaciones en catálogo:", format(nrow(catalogo), big.mark = ","), "\n")
+```
+
+La lectura inicial conserva las columnas como texto. Esta estrategia
+evita que una diferencia de formato entre archivos mensuales interrumpa
+la unión de las bases. Los tipos se convierten posteriormente de manera
+explícita, una vez que los datos están consolidados.
+
+# 2. Inspección inicial y calidad de datos
+
+```{r inspeccion-inicial}
+dim(viajes_raw)
+str(viajes_raw)
+
+faltantes_iniciales <- tibble(
+  variable = names(viajes_raw),
+  faltantes = vapply(
+    viajes_raw,
+    function(x) sum(is.na(x) | str_trim(as.character(x)) == ""),
+    numeric(1)
+  )
+) %>%
+  mutate(porcentaje = 100 * faltantes / nrow(viajes_raw)) %>%
+  arrange(desc(porcentaje))
+
+knitr::kable(
+  faltantes_iniciales,
+  digits = 2,
+  col.names = c("Variable", "Valores faltantes", "% del total")
+)
+```
+
+La inspección se realiza antes de modificar los registros para
+distinguir entre problemas de calidad de la fuente y decisiones propias
+del análisis. Los faltantes en variables demográficas, por ejemplo, no
+invalidan necesariamente un viaje para estudiar demanda por estación y
+hora.
+
+# 3. Preparación y limpieza
+
+```{r limpieza}
+n_inicial <- nrow(viajes_raw)
+
+# Conversión de tipos
+viajes_raw <- viajes_raw %>%
+  mutate(
+    Edad_Usuario = suppressWarnings(as.numeric(Edad_Usuario)),
+    Bici = as.character(Bici)
+  )
+
+# Duplicados exactos
+n_dup <- sum(duplicated(viajes_raw))
+viajes <- viajes_raw %>% distinct()
+
+# Fechas, horas y variables derivadas
+viajes <- viajes %>%
+  mutate(
+    fecha_hora_retiro = parse_date_time(
+      paste(Fecha_Retiro, Hora_Retiro),
+      orders = c("dmy HMS", "dmy HM"),
+      quiet = TRUE
+    ),
+    fecha_hora_arribo = parse_date_time(
+      paste(Fecha_Arribo, Hora_Arribo),
+      orders = c("dmy HMS", "dmy HM"),
+      quiet = TRUE
+    ),
+    fecha_retiro = as.Date(fecha_hora_retiro),
+    hora_retiro_num = hour(fecha_hora_retiro),
+    hora_arribo_num = hour(fecha_hora_arribo),
+    dia_semana = factor(
+      wday(fecha_retiro, week_start = 1),
+      levels = 1:7,
+      labels = niveles_dias
+    ),
+    mes = floor_date(fecha_retiro, "month"),
+    fin_semana = dia_semana %in% c("sábado", "domingo"),
+    duracion_min = as.numeric(
+      difftime(fecha_hora_arribo, fecha_hora_retiro, units = "mins")
+    )
+  )
+
+# Registros sin referencia temporal válida
+n_fecha_na <- sum(
+  is.na(viajes$fecha_hora_retiro) | is.na(viajes$fecha_hora_arribo)
+)
+
+viajes <- viajes %>%
+  filter(!is.na(fecha_hora_retiro), !is.na(fecha_hora_arribo))
+
+# Periodo de análisis
+periodo_inicio <- as.Date("2025-01-01")
+periodo_fin    <- as.Date("2025-12-31")
+
+n_fuera_periodo <- sum(
+  viajes$fecha_retiro < periodo_inicio |
+    viajes$fecha_retiro > periodo_fin
+)
+
+viajes <- viajes %>%
+  filter(fecha_retiro >= periodo_inicio, fecha_retiro <= periodo_fin)
+
+# Indicadores de calidad para análisis específicos
+n_duracion_atipica <- sum(
+  is.na(viajes$duracion_min) |
+    viajes$duracion_min < 1 |
+    viajes$duracion_min > 180
+)
+
+n_edad_atipica <- sum(
+  !is.na(viajes$Edad_Usuario) &
+    (viajes$Edad_Usuario < 12 | viajes$Edad_Usuario > 90)
+)
+
+viajes <- viajes %>%
+  mutate(
+    duracion_analitica = if_else(
+      duracion_min >= 1 & duracion_min <= 180,
+      duracion_min,
+      NA_real_
+    ),
+    edad_analitica = if_else(
+      Edad_Usuario >= 12 & Edad_Usuario <= 90,
+      Edad_Usuario,
+      NA_real_
+    ),
+    Genero_Usuario = case_when(
+      Genero_Usuario %in% c("M", "F", "O") ~ Genero_Usuario,
+      TRUE ~ "No especificado"
+    ),
+    Ciclo_Estacion_Retiro = str_trim(Ciclo_Estacion_Retiro),
+    Ciclo_EstacionArribo = str_trim(Ciclo_EstacionArribo)
+  )
+
+# Integración con catálogo de estaciones
+catalogo <- catalogo %>%
+  mutate(num_cicloe = str_trim(as.character(num_cicloe)))
+
+catalogo_estaciones <- catalogo %>%
+  distinct(num_cicloe, .keep_all = TRUE)
+
+estaciones_sin_match <- viajes %>%
+  filter(!(Ciclo_Estacion_Retiro %in% catalogo_estaciones$num_cicloe)) %>%
+  distinct(Ciclo_Estacion_Retiro)
+
+viajes <- viajes %>%
+  left_join(
+    catalogo_estaciones %>%
+      select(num_cicloe, colonia, alcaldia, latitud, longitud),
+    by = c("Ciclo_Estacion_Retiro" = "num_cicloe")
+  )
+
+n_final <- nrow(viajes)
+
+resumen_limpieza <- tibble(
+  indicador = c(
+    "Registros originales",
+    "Duplicados exactos",
+    "Fecha/hora no interpretable",
+    "Registros fuera de 2025",
+    "Duración fuera de 1-180 min",
+    "Edad fuera de 12-90 años",
+    "Estaciones sin coincidencia en catálogo",
+    "Registros finales para demanda"
+  ),
+  n = c(
+    n_inicial,
+    n_dup,
+    n_fecha_na,
+    n_fuera_periodo,
+    n_duracion_atipica,
+    n_edad_atipica,
+    nrow(estaciones_sin_match),
+    n_final
+  )
+)
+
+knitr::kable(
+  resumen_limpieza,
+  col.names = c("Control de calidad", "Registros")
+)
+```
+
+## Decisiones de limpieza
+
+Se eliminaron únicamente los duplicados exactos y los registros cuya
+fecha u hora no pudo interpretarse, ya que ambos casos afectan
+directamente la unidad de análisis. También se restringió la base al
+periodo definido para el estudio.
+
+Los valores de duración y edad fuera de los rangos establecidos no se
+eliminan de los conteos de demanda. En su lugar se excluyen solamente de
+las gráficas en las que esas variables son relevantes. Esta decisión
+evita modificar de forma artificial el número de viajes por estación y
+hora debido a una anomalía en una variable secundaria.
+
+Los valores no identificados de género se agrupan como
+`No especificado`. Las estaciones sin coincidencia con el catálogo se
+conservan en el análisis temporal, aunque no cuentan con atributos
+territoriales.
+
+Después del proceso se conservan **`r scales::comma(n_final)` viajes**,
+que representan
+**`r scales::percent(n_final / n_inicial, accuracy = 0.1)`** de los
+registros originales.
+
+# 4. Análisis exploratorio
+
+```{r exploracion, fig.height=6}
+# 4.1 Demanda por hora del día
+demanda_hora <- viajes %>%
+  count(hora_retiro_num, name = "n") %>%
+  arrange(hora_retiro_num)
+
+hora_pico <- demanda_hora %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+ggplot(demanda_hora, aes(hora_retiro_num, n)) +
+  geom_col(fill = "steelblue") +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes totales por hora del día",
+    x = "Hora de retiro",
+    y = "Número de viajes"
+  )
+
+# 4.2 Demanda por día de la semana
+demanda_dia <- viajes %>%
+  count(dia_semana, name = "n")
+
+dia_max <- demanda_dia %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+dia_min <- demanda_dia %>%
+  slice_min(n, n = 1, with_ties = FALSE)
+
+ggplot(demanda_dia, aes(dia_semana, n)) +
+  geom_col(fill = "darkorange") +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes por día de la semana",
+    x = NULL,
+    y = "Número de viajes"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+# 4.3 Estacionalidad mensual
+demanda_mes <- viajes %>%
+  count(mes, name = "n") %>%
+  arrange(mes)
+
+mes_max <- demanda_mes %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+mes_min <- demanda_mes %>%
+  slice_min(n, n = 1, with_ties = FALSE)
+
+ggplot(demanda_mes, aes(mes, n)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point() +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes por mes",
+    x = NULL,
+    y = "Número de viajes"
+  )
+
+# 4.4 Top-20 estaciones por retiros
+top_estaciones <- viajes %>%
+  count(Ciclo_Estacion_Retiro, colonia, sort = TRUE, name = "n") %>%
+  slice_head(n = 20)
+
+estacion_top <- top_estaciones %>%
+  slice_head(n = 1)
+
+ggplot(
+  top_estaciones,
+  aes(reorder(paste(Ciclo_Estacion_Retiro, colonia), n), n)
+) +
+  geom_col(fill = "seagreen") +
+  coord_flip() +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Top estaciones por retiros",
+    x = NULL,
+    y = "Viajes"
+  )
+
+# 4.5 Demanda por alcaldía
+demanda_alcaldia <- viajes %>%
+  filter(!is.na(alcaldia), str_trim(alcaldia) != "") %>%
+  count(alcaldia, sort = TRUE, name = "n")
+
+alcaldia_top <- demanda_alcaldia %>%
+  slice_head(n = 1)
+
+ggplot(demanda_alcaldia, aes(reorder(alcaldia, n), n)) +
+  geom_col(fill = "purple") +
+  coord_flip() +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes por alcaldía (estación de retiro)",
+    x = NULL,
+    y = "Viajes"
+  )
+
+# 4.6 Balance retiros vs. arribos
+retiros <- viajes %>%
+  count(estacion = Ciclo_Estacion_Retiro, name = "retiros")
+
+arribos <- viajes %>%
+  count(estacion = Ciclo_EstacionArribo, name = "arribos")
+
+balance <- full_join(retiros, arribos, by = "estacion") %>%
+  mutate(
+    retiros = replace_na(retiros, 0L),
+    arribos = replace_na(arribos, 0L),
+    balance_neto = arribos - retiros,
+    abs_balance = abs(balance_neto)
+  )
+
+mayor_deficit <- balance %>%
+  slice_min(balance_neto, n = 1, with_ties = FALSE)
+
+mayor_superavit <- balance %>%
+  slice_max(balance_neto, n = 1, with_ties = FALSE)
+
+balance %>%
+  slice_max(abs_balance, n = 20, with_ties = FALSE) %>%
+  ggplot(
+    aes(
+      reorder(estacion, balance_neto),
+      balance_neto,
+      fill = balance_neto > 0
+    )
+  ) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  scale_fill_manual(
+    values = c("firebrick", "steelblue"),
+    guide = "none"
+  ) +
+  labs(
+    title = "Estaciones con mayor desbalance (arribos - retiros)",
+    x = "Estación",
+    y = "Balance neto"
+  )
+
+# 4.7 Duración de viajes
+ggplot(
+  viajes %>% filter(!is.na(duracion_analitica)),
+  aes(duracion_analitica)
+) +
+  geom_histogram(binwidth = 5, fill = "tomato") +
+  labs(
+    title = "Distribución de duración de viajes",
+    subtitle = "Duraciones entre 1 y 180 minutos",
+    x = "Minutos",
+    y = "Frecuencia"
+  )
+
+# 4.8 Demografía
+ggplot(
+  viajes %>% filter(!is.na(edad_analitica)),
+  aes(edad_analitica, fill = Genero_Usuario)
+) +
+  geom_histogram(binwidth = 5, position = "identity", alpha = 0.5) +
+  labs(
+    title = "Distribución de edad por género",
+    x = "Edad",
+    y = "Frecuencia",
+    fill = "Género"
+  )
+
+# 4.9 Heatmap estación x hora
+top_est_ids <- viajes %>%
+  count(Ciclo_Estacion_Retiro, sort = TRUE) %>%
+  slice_head(n = 25) %>%
+  pull(Ciclo_Estacion_Retiro)
+
+conteos_heatmap <- viajes %>%
+  filter(Ciclo_Estacion_Retiro %in% top_est_ids) %>%
+  count(Ciclo_Estacion_Retiro, hora_retiro_num, name = "n")
+
+heatmap_datos <- expand_grid(
+  Ciclo_Estacion_Retiro = top_est_ids,
+  hora_retiro_num = 0:23
+) %>%
+  left_join(
+    conteos_heatmap,
+    by = c("Ciclo_Estacion_Retiro", "hora_retiro_num")
+  ) %>%
+  mutate(n = replace_na(n, 0L)) %>%
+  group_by(Ciclo_Estacion_Retiro) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    Ciclo_Estacion_Retiro = factor(
+      Ciclo_Estacion_Retiro,
+      levels = rev(top_est_ids)
+    )
+  )
+
+picos_estaciones <- heatmap_datos %>%
+  group_by(Ciclo_Estacion_Retiro) %>%
+  slice_max(prop, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+hora_pico_comun <- picos_estaciones %>%
+  count(hora_retiro_num, sort = TRUE) %>%
+  slice_head(n = 1)
+
+ggplot(
+  heatmap_datos,
+  aes(hora_retiro_num, Ciclo_Estacion_Retiro, fill = prop)
+) +
+  geom_tile() +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  scale_fill_viridis_c(
+    name = "% viajes\nde la estación",
+    labels = label_percent(accuracy = 0.1)
+  ) +
+  labs(
+    title = "Distribución horaria de retiros por estación (top estaciones)",
+    subtitle = "Cada estación se normaliza respecto a su propio volumen",
+    x = "Hora del día",
+    y = "Estación"
+  )
+```
+
+## Interpretación de resultados exploratorios
+
+La distribución horaria muestra que el mayor volumen de retiros se
+registra a las **`r sprintf('%02d:00', hora_pico$hora_retiro_num)`**,
+con **`r scales::comma(hora_pico$n)` viajes**. El resultado confirma que
+el uso del sistema presenta una estructura horaria definida y que la
+demanda no puede representarse adecuadamente como una tendencia lineal a
+lo largo del día.
+
+Por día de la semana, **`r as.character(dia_max$dia_semana)`** concentra
+el mayor número de viajes, mientras que
+**`r as.character(dia_min$dia_semana)`** presenta el menor. Esta
+diferencia indica que el calendario semanal aporta información relevante
+para explicar los cambios de demanda.
+
+En la evolución mensual, **`r meses_es[month(mes_max$mes)]`** registra
+el mayor volumen y **`r meses_es[month(mes_min$mes)]`** el menor. La
+gráfica permite identificar estacionalidad dentro de 2025, aunque con
+estos datos no es posible atribuir las variaciones a factores externos
+como clima, vacaciones o eventos.
+
+La estación **`r estacion_top$Ciclo_Estacion_Retiro`** encabeza el
+número de retiros con **`r scales::comma(estacion_top$n)` viajes**.
+Entre los registros vinculados al catálogo,
+**`r alcaldia_top$alcaldia`** es la alcaldía con mayor actividad de
+retiro. Estos resultados describen concentración de uso, pero no
+equivalen por sí mismos a demanda insatisfecha.
+
+El balance entre arribos y retiros aporta una lectura operativa
+adicional. La estación **`r mayor_deficit$estacion`** presenta el
+balance acumulado más negativo
+(**`r scales::comma(mayor_deficit$balance_neto)`**), mientras que
+**`r mayor_superavit$estacion`** registra el mayor balance positivo
+(**`r scales::comma(mayor_superavit$balance_neto)`**). Un balance
+negativo es compatible con una mayor presión hacia el vaciamiento; uno
+positivo, con una mayor presión hacia la ocupación. Para afirmar que una
+estación quedó vacía o saturada sería necesario contar con inventario y
+capacidad de anclajes en el tiempo.
+
+El mapa de calor permite comparar directamente estación y hora sin que
+el volumen total de cada estación domine la visualización. Entre las 25
+estaciones más utilizadas, la hora pico más frecuente es
+**`r sprintf('%02d:00', hora_pico_comun$hora_retiro_num)`**. Las
+diferencias entre filas muestran que las estaciones no comparten un
+único patrón horario, lo que sustenta el uso de clustering en la
+siguiente sección.
+
+# 5. Modelado
+
+## 5.1 Clustering de estaciones por perfil horario
+
+El objetivo del clustering es identificar estaciones cuya distribución
+horaria de retiros tenga una forma semejante. Para evitar que el
+algoritmo agrupe solo por tamaño, cada estación se normaliza respecto a
+su propio número de viajes. Así, dos estaciones pueden pertenecer al
+mismo grupo aunque tengan volúmenes distintos, siempre que sus retiros
+se concentren en horarios similares.
+
+```{r modelado-clustering}
+# Matriz estación x hora
+estaciones_validas <- viajes %>%
+  count(Ciclo_Estacion_Retiro, name = "total") %>%
+  filter(total >= 50) %>%
+  pull(Ciclo_Estacion_Retiro)
+
+perfil_horario_long <- expand_grid(
+  Ciclo_Estacion_Retiro = estaciones_validas,
+  hora_retiro_num = 0:23
+) %>%
+  left_join(
+    viajes %>%
+      filter(Ciclo_Estacion_Retiro %in% estaciones_validas) %>%
+      count(Ciclo_Estacion_Retiro, hora_retiro_num, name = "n"),
+    by = c("Ciclo_Estacion_Retiro", "hora_retiro_num")
+  ) %>%
+  mutate(n = replace_na(n, 0L)) %>%
+  group_by(Ciclo_Estacion_Retiro) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+perfil_horario <- perfil_horario_long %>%
+  select(Ciclo_Estacion_Retiro, hora_retiro_num, prop) %>%
+  pivot_wider(
+    names_from = hora_retiro_num,
+    values_from = prop,
+    values_fill = 0,
+    names_prefix = "h"
+  )
+
+mat_cluster <- perfil_horario %>%
+  select(-Ciclo_Estacion_Retiro) %>%
+  as.matrix()
+
+rownames(mat_cluster) <- perfil_horario$Ciclo_Estacion_Retiro
+
+# Las columnas sin variación no aportan distancia entre estaciones y
+# producen problemas al proyectar los clusters mediante componentes principales.
+desv_columnas <- apply(mat_cluster, 2, sd, na.rm = TRUE)
+columnas_utiles <- is.finite(desv_columnas) & desv_columnas > 0
+columnas_constantes <- colnames(mat_cluster)[!columnas_utiles]
+mat_cluster <- mat_cluster[, columnas_utiles, drop = FALSE]
+
+if (ncol(mat_cluster) < 2) {
+  stop("No hay suficientes horas con variación para realizar el clustering.")
+}
+
+if (nrow(mat_cluster) < 3) {
+  stop("No hay suficientes estaciones para realizar el clustering.")
+}
+
+cat("Estaciones incluidas en el clustering:", nrow(mat_cluster), "\n")
+cat("Variables horarias utilizadas:", ncol(mat_cluster), "\n")
+if (length(columnas_constantes) > 0) {
+  cat(
+    "Horas sin variación excluidas de la matriz:",
+    paste(columnas_constantes, collapse = ", "), "\n"
+  )
+}
+
+# Evaluación del número de clusters
+k_max <- min(8, nrow(mat_cluster) - 1)
+distancias <- dist(mat_cluster)
+
+set.seed(123)
+evaluacion_k <- bind_rows(lapply(2:k_max, function(k) {
+  ajuste <- kmeans(mat_cluster, centers = k, nstart = 25, iter.max = 100)
+  sil <- silhouette(ajuste$cluster, distancias)
+
+  tibble(
+    k = k,
+    WSS = ajuste$tot.withinss,
+    silueta = mean(sil[, 3])
+  )
+}))
+
+k_elegido <- evaluacion_k$k[which.max(evaluacion_k$silueta)]
+silueta_elegida <- max(evaluacion_k$silueta)
+
+fviz_nbclust(
+  mat_cluster,
+  kmeans,
+  method = "wss",
+  k.max = k_max,
+  nstart = 25
+) +
+  labs(title = "Método del codo")
+
+fviz_nbclust(
+  mat_cluster,
+  kmeans,
+  method = "silhouette",
+  k.max = k_max,
+  nstart = 25
+) +
+  geom_vline(xintercept = k_elegido, linetype = "dashed") +
+  labs(
+    title = "Silueta promedio",
+    subtitle = paste("Número de clusters seleccionado:", k_elegido)
+  )
+
+# Ajuste final
+set.seed(123)
+km <- kmeans(
+  mat_cluster,
+  centers = k_elegido,
+  nstart = 50,
+  iter.max = 100
+)
+
+perfil_horario$cluster <- factor(km$cluster)
+
+fviz_cluster(
+  km,
+  data = mat_cluster,
+  geom = "point",
+  ellipse.type = "convex",
+  stand = FALSE
+) +
+  labs(
+    title = paste("Clusters de estaciones por perfil horario (k =", k_elegido, ")"),
+    subtitle = "Proyección bidimensional del perfil de retiros"
+  )
+
+# Perfil horario promedio por cluster
+perfil_cluster <- perfil_horario_long %>%
+  left_join(
+    perfil_horario %>%
+      select(Ciclo_Estacion_Retiro, cluster),
+    by = "Ciclo_Estacion_Retiro"
+  ) %>%
+  group_by(cluster, hora_retiro_num) %>%
+  summarise(prop_media = mean(prop), .groups = "drop")
+
+resumen_clusters <- perfil_cluster %>%
+  group_by(cluster) %>%
+  summarise(
+    hora_pico = hora_retiro_num[which.max(prop_media)],
+    proporcion_pico = max(prop_media),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    perfil_horario %>% count(cluster, name = "n_estaciones"),
+    by = "cluster"
+  )
+
+perfil_cluster %>%
+  ggplot(aes(hora_retiro_num, prop_media, color = cluster)) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+  labs(
+    title = "Perfil horario promedio por cluster",
+    x = "Hora del día",
+    y = "Proporción media de viajes",
+    color = "Cluster"
+  )
+
+# Composición territorial de los clusters
+clusters_alcaldia <- perfil_horario %>%
+  left_join(
+    catalogo_estaciones %>% select(num_cicloe, alcaldia),
+    by = c("Ciclo_Estacion_Retiro" = "num_cicloe")
+  ) %>%
+  filter(!is.na(alcaldia), str_trim(alcaldia) != "") %>%
+  count(cluster, alcaldia)
+
+clusters_alcaldia %>%
+  ggplot(aes(alcaldia, n, fill = cluster)) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+    title = "Composición de clusters por alcaldía",
+    y = "Proporción",
+    x = NULL,
+    fill = "Cluster"
+  )
+
+knitr::kable(
+  resumen_clusters,
+  digits = 3,
+  col.names = c(
+    "Cluster",
+    "Hora pico",
+    "Proporción en hora pico",
+    "Número de estaciones"
+  )
+)
+```
+
+## Decisión: elección de k
+
+Se evaluaron soluciones de **2 a `r k_max` clusters**. El criterio
+principal fue la silueta promedio, porque considera tanto la cohesión de
+las estaciones dentro de su grupo como la separación respecto a los
+demás grupos. El máximo se obtuvo con **`r k_elegido` clusters**, con
+una silueta promedio de **`r round(silueta_elegida, 3)`**. El método del
+codo se utiliza como contraste visual para verificar que el aumento en
+el número de grupos produzca mejoras cada vez menores en la variación
+interna.
+
+Las columnas horarias sin variación se excluyeron antes del ajuste.
+Estas variables no aportan información para diferenciar estaciones y su
+eliminación evita el error de reescalamiento que puede presentarse en la
+proyección de `fviz_cluster()` cuando una columna tiene varianza cero.
+
+## Interpretación de los clusters
+
+```{r texto-clusters, results='asis'}
+dominante_alcaldia <- clusters_alcaldia %>%
+  group_by(cluster) %>%
+  mutate(prop_alc = n / sum(n)) %>%
+  slice_max(prop_alc, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(cluster, alcaldia_dominante = alcaldia, prop_alcaldia = prop_alc)
+
+resumen_clusters_desc <- resumen_clusters %>%
+  left_join(dominante_alcaldia, by = "cluster") %>%
+  mutate(
+    tipo_horario = case_when(
+      hora_pico >= 5 & hora_pico <= 10  ~ "manana",
+      hora_pico >= 15 & hora_pico <= 20 ~ "tarde",
+      TRUE ~ "mixto"
+    )
+  ) %>%
+  arrange(desc(n_estaciones))
+
+for (i in seq_len(nrow(resumen_clusters_desc))) {
+  fila <- resumen_clusters_desc[i, ]
+
+  texto <- switch(fila$tipo_horario,
+    "manana" = paste0(
+      "El **cluster ", fila$cluster, "** agrupa **", fila$n_estaciones,
+      " estaciones** con un pico de retiros concentrado en la mañana, alrededor de las **",
+      sprintf("%02d:00", fila$hora_pico), "** (", scales::percent(fila$proporcion_pico, accuracy = 0.1),
+      " de sus viajes en esa sola hora). Es compatible con un patrón de salida hacia el trabajo o la escuela, ",
+      "más que con uso recreativo. Dentro de este grupo, **", fila$alcaldia_dominante,
+      "** concentra la mayor proporción de estaciones (", scales::percent(fila$prop_alcaldia, accuracy = 1),
+      "), lo que sugiere una asociación con zonas más residenciales o periféricas del sistema.\n\n"
+    ),
+    "tarde" = paste0(
+      "El **cluster ", fila$cluster, "** agrupa **", fila$n_estaciones,
+      " estaciones** con un pico de retiros concentrado por la tarde, alrededor de las **",
+      sprintf("%02d:00", fila$hora_pico), "** (", scales::percent(fila$proporcion_pico, accuracy = 0.1),
+      " de sus viajes en esa sola hora, la concentración horaria más alta de los tres grupos). El patrón es ",
+      "compatible con salidas al término de la jornada laboral. **", fila$alcaldia_dominante,
+      "** concentra la mayor proporción de estaciones de este grupo (",
+      scales::percent(fila$prop_alcaldia, accuracy = 1),
+      "), zona con fuerte presencia de oficinas y corredores comerciales.\n\n"
+    ),
+    paste0(
+      "El **cluster ", fila$cluster, "** es el más grande de los tres, con **", fila$n_estaciones,
+      " estaciones**. Su pico (", sprintf("%02d:00", fila$hora_pico), ") es menos pronunciado que el de los ",
+      "otros grupos (", scales::percent(fila$proporcion_pico, accuracy = 0.1),
+      " de sus viajes en esa hora), es decir, reparte su actividad de forma más pareja a lo largo del día en ",
+      "vez de concentrarla en una sola franja. Es el perfil dominante en **", fila$alcaldia_dominante,
+      "** (", scales::percent(fila$prop_alcaldia, accuracy = 1),
+      " de sus estaciones) y, en general, el más común en la mayoría de las alcaldías del sistema.\n\n"
+    )
+  )
+
+  cat(texto)
+}
+```
+
+Los tres perfiles tienen una lectura geográfica consistente, no solo
+estadística: el grupo con pico matutino domina en zonas más
+residenciales, el de pico vespertino en zonas de oficinas, y el grupo
+mixto (el más grande) es transversal a casi todas las alcaldías. Dicho
+esto, la asociación territorial es descriptiva: con esta base no se
+puede afirmar que el uso de suelo *causa* el patrón horario, solo que
+ambos coinciden de forma sistemática.
+
+## 5.2 Modelo predictivo complementario: baseline con train/test
+
+Como complemento al análisis de perfiles se construye un modelo para la
+estación con mayor número de retiros. El objetivo no es desarrollar un
+sistema de pronóstico operativo definitivo, sino establecer una línea
+base y evaluar cuánto de la demanda puede explicarse mediante hora del
+día y día de la semana.
+
+La separación entre entrenamiento y prueba es cronológica: el 80%
+inicial de las fechas se utiliza para ajustar el modelo y el 20% final
+para evaluarlo. Esta decisión evita utilizar información futura para
+explicar observaciones pasadas.
+
+```{r modelado-forecasting}
+top_estacion <- viajes %>%
+  count(Ciclo_Estacion_Retiro, sort = TRUE) %>%
+  slice_head(n = 1) %>%
+  pull(Ciclo_Estacion_Retiro)
+
+serie_observada <- viajes %>%
+  filter(Ciclo_Estacion_Retiro == top_estacion) %>%
+  count(fecha_retiro, hora_retiro_num, name = "viajes")
+
+serie_top <- expand_grid(
+  fecha_retiro = seq(
+    min(serie_observada$fecha_retiro),
+    max(serie_observada$fecha_retiro),
+    by = "day"
+  ),
+  hora_retiro_num = 0:23
+) %>%
+  left_join(
+    serie_observada,
+    by = c("fecha_retiro", "hora_retiro_num")
+  ) %>%
+  mutate(
+    viajes = replace_na(viajes, 0L),
+    dia_semana = factor(
+      wday(fecha_retiro, week_start = 1),
+      levels = 1:7,
+      labels = niveles_dias
+    )
+  )
+
+fechas_disponibles <- sort(unique(serie_top$fecha_retiro))
+indice_corte <- floor(0.80 * length(fechas_disponibles))
+fecha_corte <- fechas_disponibles[indice_corte]
+
+train <- serie_top %>% filter(fecha_retiro <= fecha_corte)
+test  <- serie_top %>% filter(fecha_retiro > fecha_corte)
+
+# Modelo de referencia: efecto lineal de la hora
+modelo_hora_lineal <- lm(
+  viajes ~ hora_retiro_num + dia_semana,
+  data = train
+)
+
+# Modelo principal: la hora se trata como categoría
+modelo_baseline <- lm(
+  viajes ~ factor(hora_retiro_num) + dia_semana,
+  data = train
+)
+
+pred_lineal <- pmax(predict(modelo_hora_lineal, newdata = test), 0)
+pred_categoria <- pmax(predict(modelo_baseline, newdata = test), 0)
+
+metricas_modelo <- function(real, pred) {
+  sst <- sum((real - mean(real))^2)
+
+  tibble(
+    RMSE = sqrt(mean((real - pred)^2)),
+    MAE = mean(abs(real - pred)),
+    R2_test = ifelse(
+      sst > 0,
+      1 - sum((real - pred)^2) / sst,
+      NA_real_
+    )
+  )
+}
+
+metricas_modelos <- bind_rows(
+  metricas_modelo(test$viajes, pred_lineal) %>%
+    mutate(Modelo = "Hora lineal"),
+  metricas_modelo(test$viajes, pred_categoria) %>%
+    mutate(Modelo = "Hora categórica")
+) %>%
+  select(Modelo, RMSE, MAE, R2_test)
+
+rmse_lineal <- metricas_modelos$RMSE[metricas_modelos$Modelo == "Hora lineal"]
+rmse_categoria <- metricas_modelos$RMSE[metricas_modelos$Modelo == "Hora categórica"]
+mae_categoria <- metricas_modelos$MAE[metricas_modelos$Modelo == "Hora categórica"]
+r2_test_categoria <- metricas_modelos$R2_test[
+  metricas_modelos$Modelo == "Hora categórica"
+]
+r2_train_categoria <- summary(modelo_baseline)$r.squared
+
+mejora_rmse <- 100 * (rmse_lineal - rmse_categoria) / rmse_lineal
+
+test <- test %>%
+  mutate(
+    pred = pred_categoria,
+    residual = viajes - pred
+  )
+
+knitr::kable(
+  metricas_modelos,
+  digits = 3,
+  col.names = c("Modelo", "RMSE", "MAE", "R² en prueba")
+)
+
+# Efecto de la hora en el modelo categórico
+coefs_hora <- broom::tidy(modelo_baseline) %>%
+  filter(str_detect(term, "factor\\(hora_retiro_num\\)")) %>%
+  mutate(hora = as.integer(str_extract(term, "\\d+$")))
+
+ggplot(coefs_hora, aes(hora, estimate)) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(
+    aes(
+      ymin = estimate - std.error,
+      ymax = estimate + std.error
+    ),
+    width = 0.2
+  ) +
+  scale_x_continuous(breaks = 1:23) +
+  labs(
+    title = "Efecto estimado de cada hora sobre la demanda",
+    subtitle = "Comparación respecto a la hora base; barras = ± error estándar",
+    x = "Hora del día",
+    y = "Viajes adicionales estimados"
+  )
+
+ggplot(test, aes(viajes, pred)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "red",
+    linetype = "dashed"
+  ) +
+  labs(
+    title = paste("Real vs. predicho — estación", top_estacion),
+    subtitle = paste0(
+      "RMSE test = ", round(rmse_categoria, 2),
+      " | R² test = ", round(r2_test_categoria, 3)
+    ),
+    x = "Viajes reales",
+    y = "Viajes predichos"
+  )
+
+ggplot(test, aes(hora_retiro_num, residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, color = "red") +
+  scale_x_continuous(breaks = 0:23) +
+  labs(
+    title = "Residuales vs. hora del día",
+    x = "Hora",
+    y = "Residual (real - predicho)"
+  )
+```
+
+## Interpretación del modelo
+
+El modelo categórico obtiene un **RMSE de `r round(rmse_categoria, 2)`
+viajes** y un **MAE de `r round(mae_categoria, 2)` viajes** en el
+periodo de prueba. Su **R² fuera de muestra es
+`r round(r2_test_categoria, 3)`**. Estas métricas se calculan sobre
+observaciones posteriores a las utilizadas para entrenar el modelo, por
+lo que representan una evaluación más exigente que el ajuste dentro de
+la muestra.
+
+Frente al modelo que obliga a la hora a tener un efecto lineal, tratar
+la hora como variable categórica cambia el RMSE en
+**`r round(mejora_rmse, 1)`%**. Esta comparación es relevante porque la
+demanda observada presenta picos horarios y no una relación creciente o
+decreciente constante. La gráfica de coeficientes permite identificar
+qué horas se apartan más de la hora de referencia, mientras que la
+comparación entre valores reales y predichos muestra la precisión del
+modelo en términos absolutos.
+
+Los residuales permiten revisar si persisten errores sistemáticos por
+hora. Si se concentran por encima o por debajo de cero en ciertos
+horarios, el modelo no está capturando completamente la dinámica de esos
+periodos. Por ello se considera una línea base y no un modelo final de
+operación.
+
+# 6. Respuesta a la pregunta de investigación
+
+Los resultados muestran que la demanda de ECOBICI durante 2025 presenta
+una estructura temporal y espacial diferenciada. El máximo global de
+retiros ocurre a las
+**`r sprintf('%02d:00', hora_pico$hora_retiro_num)`**, pero el mapa de
+calor evidencia que la hora de mayor actividad no es idéntica para todas
+las estaciones.
+
+El clustering respalda esta heterogeneidad: la solución seleccionada
+contiene **`r k_elegido` grupos**, definidos por la forma de sus
+perfiles horarios y no por su volumen total. Esto permite resumir
+estaciones con comportamientos semejantes y reconocer los periodos en
+los que cada grupo concentra sus retiros.
+
+El balance acumulado entre arribos y retiros también identifica
+estaciones con presiones distintas. Sin embargo, los datos analizados no
+incluyen inventario de bicicletas ni capacidad disponible de anclajes
+por minuto; por tanto, el análisis permite identificar **señales de
+presión operativa**, pero no demostrar de manera directa episodios de
+desabasto o saturación.
+
+# 7. Conclusiones
+
+El análisis confirma que la hora del día es una dimensión central para
+explicar la utilización del sistema. Las diferencias por día, mes,
+estación y alcaldía muestran que el volumen total por sí solo no
+describe completamente el comportamiento de ECOBICI.
+
+El clustering complementa el análisis exploratorio al condensar los
+perfiles de 24 horas en grupos interpretables. La selección de `k`
+mediante silueta evita fijar el número de clusters únicamente por
+criterio visual. La comparación territorial sirve como evidencia
+descriptiva adicional, aunque no permite atribuir las diferencias a
+características urbanas específicas.
+
+El modelo predictivo muestra hasta qué punto una especificación sencilla
+basada en calendario puede aproximar la demanda de una estación de alta
+actividad. Su valor principal es establecer una referencia cuantitativa
+que pueda mejorarse posteriormente con variables externas y modelos
+temporales más completos.
+
+# 8. Limitaciones
+
+La principal limitación es que la base contiene viajes realizados, no el
+estado instantáneo de cada estación. En consecuencia, el balance entre
+retiros y arribos no debe interpretarse como disponibilidad real de
+bicicletas o espacios.
+
+Tampoco se incorporan variables meteorológicas, días festivos, eventos,
+capacidad de estaciones, redistribución realizada por el operador ni
+cambios en infraestructura. Estos factores pueden explicar parte de la
+variación que el modelo base deja en los residuales.
+
+Por último, K-means resume los perfiles mediante distancias entre
+proporciones y supone grupos relativamente compactos. Los clusters deben
+entenderse como una herramienta descriptiva para sintetizar patrones, no
+como categorías naturales o permanentes de las estaciones.
+
+# 9. Posibles extensiones
+
+Una continuación natural sería integrar información de capacidad e
+inventario por estación para medir directamente episodios de saturación
+y desabasto. También sería útil incorporar clima, festivos y eventos,
+así como evaluar modelos de conteo o series de tiempo con validación
+temporal.
+
+Para enriquecer la interpretación espacial, los clusters podrían
+relacionarse con uso de suelo, densidad de empleo, estaciones de
+transporte público y otras características del entorno urbano.
+
+# Guardado de objetos
+
+Los siguientes objetos se pueden compartir con el equipo para construir
+la visualización final sin repetir todo el procesamiento.
+
+```{r guardar, eval=FALSE}
+dir.create(carpeta_salida, showWarnings = FALSE, recursive = TRUE)
+saveRDS(viajes, file.path(carpeta_salida, "viajes_limpios_2025.rds"))
+saveRDS(perfil_horario, file.path(carpeta_salida, "perfil_horario_clusters.rds"))
+saveRDS(km, file.path(carpeta_salida, "modelo_kmeans.rds"))
+saveRDS(modelo_baseline, file.path(carpeta_salida, "modelo_baseline_lm.rds"))
+```
