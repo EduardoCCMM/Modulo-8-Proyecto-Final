@@ -1,7 +1,7 @@
 # ECOBICI CDMX 
 ## **Módulo 8 · Proyecto Final**
 
-**Dashboard publicado:** https://rpubs.com/EliLopez01/1464119
+**Dashboard publicado:** https://rpubs.com/EDCM/ECOBICI
 
 **Notebook:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/notebook_equipo_final.Rmd
 
@@ -9,7 +9,7 @@
 
 **Dashboard RMD:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/dashboard_ecobici_2025.Rmd
 
-**Dashboard HTML:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/dashboard_ecobici_2025.html
+**Dashboard HTML:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/dashboard_ecobici_dinamico--1-.html
 
 ---
 ### Integrantes
