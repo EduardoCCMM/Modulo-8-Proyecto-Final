@@ -1,11 +1,20 @@
 # ECOBICI CDMX · 
 ### **Equipo 9 · Módulo 8 · Proyecto Final**
 
-**Dashboard publicado:** https://eduardoccmm.github.io/Modulo-8---Proyecto-Final/dashboard_ecobici_2025.html
-**Repositorio:** https://github.com/EduardoCCMM/Modulo-8---Proyecto-Final
+**Dashboard publicado:** https://rpubs.com/EliLopez01/1464119
 
 ---
+### Integrantes
 
+**Equipo 9**
+
+- Ayala López Elizabeth
+- Cruz Miguel Eduardo
+- Marco Antonio Díaz López
+- Romero Rossano Sebastian
+- Toriz Pacheco Vanessa
+- Hugo Valverde Guadalupe
+---
 ## ¿De qué trata el proyecto?
 
 ECOBICI, el sistema de bicicletas compartidas de la Ciudad de México, conecta estaciones mediante viajes cuya intensidad cambia según la hora y el territorio. Este proyecto analiza los **viajes registrados entre enero y diciembre de 2025** para responder:
@@ -144,16 +153,6 @@ Estos rangos son reglas analíticas del equipo, no límites oficiales de operaci
 
 ---
 
-## Integrantes
-
-**Equipo 9**
-
-- Ayala López Elizabeth
-- Cruz Miguel Eduardo
-- Marco Antonio Díaz López
-- Romero Rossano Sebastian
-- Toriz Pacheco Vanessa
-- Hugo Valverde Guadalupe
 
 ---
 
