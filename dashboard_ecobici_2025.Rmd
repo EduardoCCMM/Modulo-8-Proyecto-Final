@@ -1,0 +1,1590 @@
+---
+title: "ECOBICI CDMX · 2025"
+subtitle: "Patrones horarios, perfiles de estaciones y presión operativa · explorador dinámico por mes"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme:
+      version: 4
+      bootswatch: flatly
+      primary: "#174A5B"
+      navbar-bg: "#174A5B"
+      success: "#2E9E4F"
+    source_code: embed
+    self_contained: true
+---
+
+
+```{r setup, include=FALSE}
+# Instalar una vez en consola:
+# install.packages(c("flexdashboard", "data.table", "dplyr", "tidyr", "lubridate",
+#   "ggplot2", "stringr", "scales", "cluster", "DT", "plotly", "leaflet", "broom", "jsonlite"))
+library(flexdashboard)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(stringr)
+library(scales)
+library(cluster)
+library(DT)
+library(plotly)
+library(leaflet)
+library(broom)
+library(jsonlite)
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+options(scipen=999)
+niveles_dias <- c("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+meses_es <- c("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+verde <- "#2E9E4F"; azul <- "#174A5B"; coral <- "#E76F51"
+paleta <- c(verde,"#3274A1","#F4A261","#7A5195",coral,"#2A9D8F","#A67C00","#66757F")
+tema <- theme_minimal(base_size=11) + theme(legend.position="bottom",
+ panel.grid.minor=element_blank(), plot.title=element_text(color=azul,face="bold"),
+ plot.margin=margin(10,12,8,8))
+# Márgenes automáticos y espacio para etiquetas en gráficas interactivas.
+widget <- function(p) {
+  ggplotly(p + tema, height=420, width=NULL) %>%
+    layout(autosize=TRUE, margin=list(l=95,r=45,t=60,b=95),
+      xaxis=list(automargin=TRUE),yaxis=list(automargin=TRUE),
+      legend=list(orientation="h",x=0,y=-.22,xanchor="left",yanchor="top",font=list(size=11)),
+      hoverlabel=list(font=list(size=12))) %>%
+    config(displayModeBar=FALSE,responsive=TRUE)
+}
+tabla <- function(x) datatable(x, rownames=FALSE, class="compact stripe",
+ options=list(pageLength=8,scrollX=TRUE,autoWidth=TRUE,dom="ftip",
+  language=list(search="Buscar:",lengthMenu="Mostrar _MENU_ filas",
+    info="_START_–_END_ de _TOTAL_",infoEmpty="Sin filas",zeroRecords="Sin coincidencias",
+    paginate=list(previous="Anterior",`next`="Siguiente"))))
+# ---------------------------------------------------------------------------
+# Datos: SOLO CSV. Se leen los doce archivos data/raw/2025-01.csv ... 2025-12.csv
+# (obligatorios). No se usa ningún RDS.
+# ---------------------------------------------------------------------------
+ruta_raw <- "C:/Users/eduar/OneDrive/DIPLOMADO/Modulo 8/Proyecto Final/data/raw"
+periodo_ini <- as.Date("2025-01-01"); periodo_fin <- as.Date("2025-12-31")
+meses_ctl <- seq(as.Date("2025-01-01"), as.Date("2025-12-01"), by = "month")   # 12 meses de la barra
+# Catálogo: se usa únicamente este archivo.
+archivo_catalogo <- "C:/Users/eduar/OneDrive/DIPLOMADO/Modulo 8/Proyecto Final/data/Catálogo Ecobici.csv"
+if (!file.exists(archivo_catalogo)) stop("No se encontró el catálogo en: ", archivo_catalogo)
+normalizar <- function(x) gsub("[^a-z0-9]", "", tolower(iconv(x,to="ASCII//TRANSLIT")))
+columna <- function(df, nombre, requerida=TRUE) {
+ i <- which(normalizar(names(df)) == normalizar(nombre))
+ if(length(i)) return(df[[i[1]]])
+ if(requerida) stop("Falta columna ", nombre, ". Disponibles: ", paste(names(df),collapse=", "))
+ rep(NA_character_,nrow(df))
+}
+# Se recortan espacios igual que en el notebook; no se fusionan IDs compuestos.
+id <- function(x) na_if(str_trim(as.character(x)), "")
+cat_raw <- fread(archivo_catalogo, encoding="UTF-8", colClasses="character")
+catalogo_estaciones <- tibble(num_cicloe=id(columna(cat_raw,"num_cicloe")),
+ colonia=columna(cat_raw,"colonia"), alcaldia=columna(cat_raw,"alcaldia"),
+ latitud=suppressWarnings(as.numeric(columna(cat_raw,"latitud"))),
+ longitud=suppressWarnings(as.numeric(columna(cat_raw,"longitud")))) %>% filter(!is.na(num_cicloe))
+# El notebook conserva el primer registro de cada ID: no ocultar inconsistencias.
+if(anyDuplicated(catalogo_estaciones$num_cicloe)) stop("El catálogo tiene IDs duplicados. Revisa sus atributos antes de unirlo.")
+rm(cat_raw)
+
+# Limpieza desde CSV (misma lógica del notebook, con el periodo enero-diciembre de 2025).
+limpiar_csv <- function(archivos) {
+ lista <- lapply(archivos, function(f) {
+  x <- fread(f, encoding="UTF-8",colClasses="character",showProgress=FALSE)
+  tibble(Edad_Usuario=columna(x,"Edad_Usuario"), Bici=columna(x,"Bici"),
+   Fecha_Retiro=columna(x,"Fecha_Retiro"), Hora_Retiro=columna(x,"Hora_Retiro"),
+   Fecha_Arribo=columna(x,"Fecha_Arribo"), Hora_Arribo=columna(x,"Hora_Arribo"),
+   Genero_Usuario=columna(x,"Genero_Usuario"),
+   Ciclo_Estacion_Retiro=columna(x,"Ciclo_Estacion_Retiro"),
+   Ciclo_EstacionArribo=columna(x,"Ciclo_EstacionArribo"))
+ })
+ v <- bind_rows(lista); rm(lista); invisible(gc())
+ v <- v %>% mutate(Edad_Usuario=suppressWarnings(as.numeric(Edad_Usuario)),Bici=as.character(Bici))
+ n_inicial <- nrow(v)
+ v <- distinct(v); n_dup <- n_inicial-nrow(v)
+ v <- v %>% mutate(
+  fecha_hora_retiro=parse_date_time(paste(Fecha_Retiro,Hora_Retiro),orders=c("dmy HMS","dmy HM"),quiet=TRUE),
+  fecha_hora_arribo=parse_date_time(paste(Fecha_Arribo,Hora_Arribo),orders=c("dmy HMS","dmy HM"),quiet=TRUE))
+ n_fecha_na <- sum(is.na(v$fecha_hora_retiro)|is.na(v$fecha_hora_arribo))
+ v <- v %>% filter(!is.na(fecha_hora_retiro),!is.na(fecha_hora_arribo)) %>%
+  mutate(fecha_retiro=as.Date(fecha_hora_retiro),
+   duracion_min=as.numeric(difftime(fecha_hora_arribo,fecha_hora_retiro,units="mins")))
+ n_fuera <- sum(v$fecha_retiro<periodo_ini | v$fecha_retiro>periodo_fin)
+ v <- filter(v, fecha_retiro>=periodo_ini, fecha_retiro<=periodo_fin)
+ attr(v,"calidad") <- tibble(Control=c("Registros originales","Duplicados exactos","Fecha/hora no interpretable","Fuera del periodo","Finales para demanda"),
+  Registros=c(n_inicial,n_dup,n_fecha_na,n_fuera,nrow(v)))
+ v
+}
+
+archivos <- file.path(ruta_raw, sprintf("2025-%02d.csv",1:12))
+if(any(!file.exists(archivos))) stop("Faltan CSV en ", ruta_raw, ": ", paste(basename(archivos[!file.exists(archivos)]),collapse=", "))
+viajes <- limpiar_csv(archivos)
+calidad_cruda <- attr(viajes,"calidad")
+origen <- paste0("CSV en data/raw (", length(archivos), " archivos mensuales)")
+
+# Los IDs se conservan como texto (ejemplo: 004, 001).
+viajes$Ciclo_Estacion_Retiro <- id(columna(viajes,"Ciclo_Estacion_Retiro"))
+viajes$Ciclo_EstacionArribo <- id(columna(viajes,"Ciclo_EstacionArribo"))
+if(anyNA(viajes$fecha_hora_retiro)||anyNA(viajes$fecha_hora_arribo))
+ stop("La base tiene fechas inválidas. Revisa su limpieza; no se eliminan silenciosamente.")
+viajes <- viajes %>% mutate(fecha_retiro=as.Date(fecha_hora_retiro))
+n_fuera_periodo <- sum(viajes$fecha_retiro<periodo_ini | viajes$fecha_retiro>periodo_fin)
+if(n_fuera_periodo>0) message("Se excluyen ", n_fuera_periodo, " viajes fuera de enero-diciembre de 2025.")
+viajes <- viajes %>% filter(fecha_retiro>=periodo_ini, fecha_retiro<=periodo_fin) %>% mutate(
+ hora_retiro_num=hour(fecha_hora_retiro),hora_arribo_num=hour(fecha_hora_arribo),
+ dia_semana=factor(wday(fecha_retiro,week_start=1),levels=1:7,labels=niveles_dias),
+ mes=floor_date(fecha_retiro,"month"),fin_semana=dia_semana %in% c("sábado","domingo"),
+ duracion_min=as.numeric(difftime(fecha_hora_arribo,fecha_hora_retiro,units="mins")),
+ Edad_Usuario=suppressWarnings(as.numeric(Edad_Usuario)))
+viajes <- viajes %>% mutate(
+ duracion_analitica=if_else(duracion_min>=1 & duracion_min<=180,duracion_min,NA_real_),
+ edad_analitica=if_else(Edad_Usuario>=12 & Edad_Usuario<=90,Edad_Usuario,NA_real_),
+ Genero_Usuario=case_when(Genero_Usuario %in% c("M","F","O") ~ Genero_Usuario,TRUE ~ "No especificado")) %>%
+ select(-any_of(c("colonia","alcaldia","latitud","longitud"))) %>%
+ left_join(catalogo_estaciones,by=c("Ciclo_Estacion_Retiro"="num_cicloe"))
+if(nrow(viajes)==0) stop("No hay viajes dentro del periodo enero-diciembre de 2025.")
+meses_disp <- sort(unique(viajes$mes))
+message("Meses con datos: ", paste(format(meses_disp,"%Y-%m"),collapse=", "))
+n_final <- nrow(viajes)
+
+
+# 4.1 Demanda por hora del día
+demanda_hora <- viajes %>%
+  count(hora_retiro_num, name = "n") %>%
+  arrange(hora_retiro_num)
+
+hora_pico <- demanda_hora %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+ggplot(demanda_hora, aes(hora_retiro_num, n)) +
+  geom_col(fill = "steelblue") +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes totales por hora del día",
+    x = "Hora de retiro",
+    y = "Número de viajes"
+  )
+
+# 4.2 Demanda por día de la semana
+demanda_dia <- viajes %>%
+  count(dia_semana, name = "n")
+
+dia_max <- demanda_dia %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+dia_min <- demanda_dia %>%
+  slice_min(n, n = 1, with_ties = FALSE)
+
+ggplot(demanda_dia, aes(dia_semana, n)) +
+  geom_col(fill = "darkorange") +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes por día de la semana",
+    x = NULL,
+    y = "Número de viajes"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+# 4.3 Estacionalidad mensual
+demanda_mes <- viajes %>%
+  count(mes, name = "n") %>%
+  arrange(mes)
+
+mes_max <- demanda_mes %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+mes_min <- demanda_mes %>%
+  slice_min(n, n = 1, with_ties = FALSE)
+
+ggplot(demanda_mes, aes(mes, n)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point() +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes por mes",
+    x = NULL,
+    y = "Número de viajes"
+  )
+
+# 4.4 Top-20 estaciones por retiros
+top_estaciones <- viajes %>%
+  count(Ciclo_Estacion_Retiro, colonia, sort = TRUE, name = "n") %>%
+  slice_head(n = 20)
+
+estacion_top <- top_estaciones %>%
+  slice_head(n = 1)
+
+ggplot(
+  top_estaciones,
+  aes(reorder(paste(Ciclo_Estacion_Retiro, colonia), n), n)
+) +
+  geom_col(fill = "seagreen") +
+  coord_flip() +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Top estaciones por retiros",
+    x = NULL,
+    y = "Viajes"
+  )
+
+# 4.5 Demanda por alcaldía
+demanda_alcaldia <- viajes %>%
+  filter(!is.na(alcaldia), str_trim(alcaldia) != "") %>%
+  count(alcaldia, sort = TRUE, name = "n")
+
+alcaldia_top <- demanda_alcaldia %>%
+  slice_head(n = 1)
+
+ggplot(demanda_alcaldia, aes(reorder(alcaldia, n), n)) +
+  geom_col(fill = "purple") +
+  coord_flip() +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Viajes por alcaldía (estación de retiro)",
+    x = NULL,
+    y = "Viajes"
+  )
+
+# 4.6 Balance retiros vs. arribos
+retiros <- viajes %>%
+  count(estacion = Ciclo_Estacion_Retiro, name = "retiros")
+
+arribos <- viajes %>%
+  count(estacion = Ciclo_EstacionArribo, name = "arribos")
+
+balance <- full_join(retiros, arribos, by = "estacion") %>%
+  mutate(
+    retiros = replace_na(retiros, 0L),
+    arribos = replace_na(arribos, 0L),
+    balance_neto = arribos - retiros,
+    abs_balance = abs(balance_neto)
+  )
+
+mayor_deficit <- balance %>%
+  slice_min(balance_neto, n = 1, with_ties = FALSE)
+
+mayor_superavit <- balance %>%
+  slice_max(balance_neto, n = 1, with_ties = FALSE)
+
+balance %>%
+  slice_max(abs_balance, n = 20, with_ties = FALSE) %>%
+  ggplot(
+    aes(
+      reorder(estacion, balance_neto),
+      balance_neto,
+      fill = balance_neto > 0
+    )
+  ) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  scale_fill_manual(
+    values = c("firebrick", "steelblue"),
+    guide = "none"
+  ) +
+  labs(
+    title = "Estaciones con mayor desbalance (arribos - retiros)",
+    x = "Estación",
+    y = "Balance neto"
+  )
+
+
+# 4.9 Heatmap estación x hora
+top_est_ids <- viajes %>%
+  count(Ciclo_Estacion_Retiro, sort = TRUE) %>%
+  slice_head(n = 25) %>%
+  pull(Ciclo_Estacion_Retiro)
+
+conteos_heatmap <- viajes %>%
+  filter(Ciclo_Estacion_Retiro %in% top_est_ids) %>%
+  count(Ciclo_Estacion_Retiro, hora_retiro_num, name = "n")
+
+heatmap_datos <- expand_grid(
+  Ciclo_Estacion_Retiro = top_est_ids,
+  hora_retiro_num = 0:23
+) %>%
+  left_join(
+    conteos_heatmap,
+    by = c("Ciclo_Estacion_Retiro", "hora_retiro_num")
+  ) %>%
+  mutate(n = replace_na(n, 0L)) %>%
+  group_by(Ciclo_Estacion_Retiro) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    Ciclo_Estacion_Retiro = factor(
+      Ciclo_Estacion_Retiro,
+      levels = rev(top_est_ids)
+    )
+  )
+
+picos_estaciones <- heatmap_datos %>%
+  group_by(Ciclo_Estacion_Retiro) %>%
+  slice_max(prop, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+hora_pico_comun <- picos_estaciones %>%
+  count(hora_retiro_num, sort = TRUE) %>%
+  slice_head(n = 1)
+
+ggplot(
+  heatmap_datos,
+  aes(hora_retiro_num, Ciclo_Estacion_Retiro, fill = prop)
+) +
+  geom_tile() +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  scale_fill_viridis_c(
+    name = "% viajes\nde la estación",
+    labels = label_percent(accuracy = 0.1)
+  ) +
+  labs(
+    title = "Distribución horaria de retiros por estación (top estaciones)",
+    subtitle = "Cada estación se normaliza respecto a su propio volumen",
+    x = "Hora del día",
+    y = "Estación"
+  )
+# Matriz estación x hora
+estaciones_validas <- viajes %>%
+  count(Ciclo_Estacion_Retiro, name = "total") %>%
+  filter(!is.na(Ciclo_Estacion_Retiro), Ciclo_Estacion_Retiro != "", total >= 50) %>%
+  pull(Ciclo_Estacion_Retiro)
+
+perfil_horario_long <- expand_grid(
+  Ciclo_Estacion_Retiro = estaciones_validas,
+  hora_retiro_num = 0:23
+) %>%
+  left_join(
+    viajes %>%
+      filter(Ciclo_Estacion_Retiro %in% estaciones_validas) %>%
+      count(Ciclo_Estacion_Retiro, hora_retiro_num, name = "n"),
+    by = c("Ciclo_Estacion_Retiro", "hora_retiro_num")
+  ) %>%
+  mutate(n = replace_na(n, 0L)) %>%
+  group_by(Ciclo_Estacion_Retiro) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+perfil_horario <- perfil_horario_long %>%
+  select(Ciclo_Estacion_Retiro, hora_retiro_num, prop) %>%
+  pivot_wider(
+    names_from = hora_retiro_num,
+    values_from = prop,
+    values_fill = 0,
+    names_prefix = "h"
+  )
+
+mat_cluster <- perfil_horario %>%
+  select(-Ciclo_Estacion_Retiro) %>%
+  as.matrix()
+
+rownames(mat_cluster) <- perfil_horario$Ciclo_Estacion_Retiro
+
+# Las columnas sin variación no aportan distancia entre estaciones y
+# producen problemas al proyectar los clusters mediante componentes principales.
+desv_columnas <- apply(mat_cluster, 2, sd, na.rm = TRUE)
+columnas_utiles <- is.finite(desv_columnas) & desv_columnas > 0
+columnas_constantes <- colnames(mat_cluster)[!columnas_utiles]
+mat_cluster <- mat_cluster[, columnas_utiles, drop = FALSE]
+
+if (ncol(mat_cluster) < 2) {
+  stop("No hay suficientes horas con variación para realizar el clustering.")
+}
+
+if (nrow(mat_cluster) < 3) {
+  stop("No hay suficientes estaciones para realizar el clustering.")
+}
+
+cat("Estaciones incluidas en el clustering:", nrow(mat_cluster), "\n")
+cat("Variables horarias utilizadas:", ncol(mat_cluster), "\n")
+if (length(columnas_constantes) > 0) {
+  cat(
+    "Horas sin variación excluidas de la matriz:",
+    paste(columnas_constantes, collapse = ", "), "\n"
+  )
+}
+
+# Evaluación del número de clusters
+k_max <- min(8, nrow(mat_cluster) - 1, nrow(unique(as.data.frame(mat_cluster))) - 1)
+if (k_max < 2) stop("No hay suficientes perfiles distintos para evaluar clustering.")
+distancias <- dist(mat_cluster)
+
+set.seed(123)
+evaluacion_k <- bind_rows(lapply(2:k_max, function(k) {
+  ajuste <- kmeans(mat_cluster, centers = k, nstart = 25, iter.max = 100)
+  sil <- silhouette(ajuste$cluster, distancias)
+
+  tibble(
+    k = k,
+    WSS = ajuste$tot.withinss,
+    silueta = mean(sil[, 3])
+  )
+}))
+
+k_elegido <- evaluacion_k$k[which.max(evaluacion_k$silueta)]
+silueta_elegida <- max(evaluacion_k$silueta)
+
+
+
+# Ajuste final
+set.seed(123)
+km <- kmeans(
+  mat_cluster,
+  centers = k_elegido,
+  nstart = 50,
+  iter.max = 100
+)
+
+perfil_horario$cluster <- factor(km$cluster)
+silueta_final <- mean(silhouette(km$cluster, distancias)[, 3])
+
+
+# Perfil horario promedio por cluster
+perfil_cluster <- perfil_horario_long %>%
+  left_join(
+    perfil_horario %>%
+      select(Ciclo_Estacion_Retiro, cluster),
+    by = "Ciclo_Estacion_Retiro"
+  ) %>%
+  group_by(cluster, hora_retiro_num) %>%
+  summarise(prop_media = mean(prop), .groups = "drop")
+
+resumen_clusters <- perfil_cluster %>%
+  group_by(cluster) %>%
+  summarise(
+    hora_pico = hora_retiro_num[which.max(prop_media)],
+    proporcion_pico = max(prop_media),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    perfil_horario %>% count(cluster, name = "n_estaciones"),
+    by = "cluster"
+  )
+
+perfil_cluster %>%
+  ggplot(aes(hora_retiro_num, prop_media, color = cluster)) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+  labs(
+    title = "Perfil horario promedio por cluster",
+    x = "Hora del día",
+    y = "Proporción media de viajes",
+    color = "Cluster"
+  )
+
+# Composición territorial de los clusters
+clusters_alcaldia <- perfil_horario %>%
+  left_join(
+    catalogo_estaciones %>% select(num_cicloe, alcaldia),
+    by = c("Ciclo_Estacion_Retiro" = "num_cicloe")
+  ) %>%
+  filter(!is.na(alcaldia), str_trim(alcaldia) != "") %>%
+  count(cluster, alcaldia)
+
+clusters_alcaldia %>%
+  ggplot(aes(alcaldia, n, fill = cluster)) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+    title = "Composición de clusters por alcaldía",
+    y = "Proporción",
+    x = NULL,
+    fill = "Cluster"
+  )
+
+knitr::kable(
+  resumen_clusters,
+  digits = 3,
+  col.names = c(
+    "Cluster",
+    "Hora pico",
+    "Proporción en hora pico",
+    "Número de estaciones"
+  )
+)
+
+# Complementos para comunicación y mapas.
+diario <- tibble(fecha_retiro=seq(min(viajes$fecha_retiro),max(viajes$fecha_retiro),by="day")) %>%
+ left_join(count(viajes,fecha_retiro,name="n"),by="fecha_retiro") %>%
+ mutate(dia_semana=factor(wday(fecha_retiro,week_start=1),levels=1:7,labels=niveles_dias),mes=floor_date(fecha_retiro,"month"))
+mensual <- demanda_mes %>% mutate(promedio_diario=n/days_in_month(mes))   # días calendario
+dia_promedio <- diario %>% group_by(dia_semana) %>% summarise(promedio=mean(n,na.rm=TRUE),.groups="drop")
+heat_dia <- viajes %>% count(dia_semana,hora_retiro_num,name="n") %>%
+ complete(dia_semana,hora_retiro_num=0:23,fill=list(n=0))
+demanda_estacion <- viajes %>% filter(!is.na(Ciclo_Estacion_Retiro)) %>%
+ count(Ciclo_Estacion_Retiro,name="n") %>% left_join(catalogo_estaciones,by=c("Ciclo_Estacion_Retiro"="num_cicloe"))
+mapa_demanda <- demanda_estacion %>% filter(between(latitud,19,20),between(longitud,-100,-98))
+mapa_cluster <- perfil_horario %>% select(Ciclo_Estacion_Retiro,cluster) %>%
+ left_join(catalogo_estaciones,by=c("Ciclo_Estacion_Retiro"="num_cicloe")) %>%
+ filter(between(latitud,19,20),between(longitud,-100,-98))
+pct_sin_catalogo <- mean(is.na(viajes$alcaldia))
+mediana_duracion <- median(viajes$duracion_analitica,na.rm=TRUE)
+# PCA es únicamente una proyección visual; distancias del modelo permanecen sin escalar.
+pca <- prcomp(mat_cluster,center=TRUE,scale.=FALSE)
+pca_df <- tibble(PC1=pca$x[,1],PC2=pca$x[,2],cluster=factor(km$cluster))
+var_pca <- sum(pca$sdev[1:2]^2)/sum(pca$sdev^2)
+
+# Regresión complementaria: reproduce la versión del notebook del equipo.
+# Selección retrospectiva: estación con más retiros en TODO el periodo cargado.
+top_estacion <- viajes %>% filter(!is.na(Ciclo_Estacion_Retiro)) %>%
+ count(Ciclo_Estacion_Retiro,sort=TRUE) %>% slice_head(n=1) %>% pull(Ciclo_Estacion_Retiro)
+serie_observada <- viajes %>% filter(Ciclo_Estacion_Retiro==top_estacion) %>%
+ count(fecha_retiro,hora_retiro_num,name="viajes")
+serie_top <- expand_grid(fecha_retiro=seq(min(serie_observada$fecha_retiro),
+ max(serie_observada$fecha_retiro),by="day"),hora_retiro_num=0:23) %>%
+ left_join(serie_observada,by=c("fecha_retiro","hora_retiro_num")) %>%
+ mutate(viajes=replace_na(viajes,0L),
+ dia_semana=factor(wday(fecha_retiro,week_start=1),levels=1:7,labels=niveles_dias))
+fechas_disponibles <- sort(unique(serie_top$fecha_retiro))
+indice_corte <- floor(.80*length(fechas_disponibles))
+if(indice_corte<7 || indice_corte>=length(fechas_disponibles)) stop("No hay fechas suficientes para train/test.")
+fecha_corte <- fechas_disponibles[indice_corte]
+train <- filter(serie_top,fecha_retiro<=fecha_corte); test <- filter(serie_top,fecha_retiro>fecha_corte)
+modelo_hora_lineal <- lm(viajes~hora_retiro_num+dia_semana,data=train)
+modelo_baseline <- lm(viajes~factor(hora_retiro_num)+dia_semana,data=train)
+pred_lineal <- pmax(predict(modelo_hora_lineal,newdata=test),0)
+pred_categoria <- pmax(predict(modelo_baseline,newdata=test),0)
+metricas <- function(real,pred) {
+ sst <- sum((real-mean(real))^2)
+ tibble(RMSE=sqrt(mean((real-pred)^2)),MAE=mean(abs(real-pred)),
+ R2_test=if(sst>0) 1-sum((real-pred)^2)/sst else NA_real_)
+}
+metricas_modelos <- bind_rows(metricas(test$viajes,pred_lineal) %>% mutate(Modelo="Hora lineal"),
+ metricas(test$viajes,pred_categoria) %>% mutate(Modelo="Hora categórica")) %>% select(Modelo,everything())
+test <- mutate(test,pred=pred_categoria,residual=viajes-pred)
+pred_diaria <- test %>% group_by(fecha_retiro) %>% summarise(Observado=sum(viajes),Predicho=sum(pred),.groups="drop") %>%
+ pivot_longer(-fecha_retiro,names_to="Serie",values_to="Viajes")
+coefs_hora <- broom::tidy(modelo_baseline) %>% filter(str_detect(term,"factor\\(hora_retiro_num\\)")) %>%
+ mutate(hora=as.integer(str_extract(term,"\\d+$")))
+# Resultados de comunicación; todos se calculan desde la base del equipo.
+rmse_lineal <- metricas_modelos$RMSE[metricas_modelos$Modelo=="Hora lineal"]
+rmse_categoria <- metricas_modelos$RMSE[metricas_modelos$Modelo=="Hora categórica"]
+mae_categoria <- metricas_modelos$MAE[metricas_modelos$Modelo=="Hora categórica"]
+r2_categoria <- metricas_modelos$R2_test[metricas_modelos$Modelo=="Hora categórica"]
+mejora_rmse <- if(rmse_lineal>0) 100*(rmse_lineal-rmse_categoria)/rmse_lineal else NA_real_
+porcentaje_top20 <- sum(top_estaciones$n)/n_final
+pct_hora_pico <- hora_pico$n/n_final
+balance <- balance %>% mutate(movimientos=retiros+arribos,
+ desequilibrio_relativo=if_else(movimientos>0,balance_neto/movimientos,NA_real_))
+cluster_descripcion <- perfil_cluster %>% group_by(cluster) %>% summarise(
+ manana_6_10=sum(prop_media[hora_retiro_num %in% 6:10]),
+ tarde_16_20=sum(prop_media[hora_retiro_num %in% 16:20]),.groups="drop") %>%
+ left_join(resumen_clusters,by="cluster")
+calidad_mensual <- diario %>% group_by(mes) %>% summarise(
+ dias_calendario=n(),dias_con_registro=sum(!is.na(n)),
+ cobertura=dias_con_registro/dias_calendario,.groups="drop")
+# Enlaces editoriales: completar cuando se publique y se cree el repositorio.
+url_visualizacion <- ""
+url_repositorio <- ""
+integrantes <- "Ayala López Elizabeth, Cruz Miguel Eduardo, Díaz López Marco Antonio, Romero Rossano Sebastián, Toriz Pacheco Vanessa, Valverde Guadalupe Hugo"
+invisible(gc())
+
+# ---------------------------------------------------------------------------
+# Cubos agregados para la barra dinámica de meses (se incrustan en el HTML).
+# No contienen viajes individuales: solo conteos por mes/día/hora/estación.
+# ---------------------------------------------------------------------------
+mi <- function(x) match(as.Date(x), meses_ctl) - 1L          # índice 0..19 del mes
+gen_lv <- c("F","M","O","No especificado")
+ids_est <- sort(unique(c(na.omit(viajes$Ciclo_Estacion_Retiro), na.omit(viajes$Ciclo_EstacionArribo))))
+meta_est <- tibble(id=ids_est) %>% left_join(catalogo_estaciones, by=c("id"="num_cicloe"))
+ie <- function(x) match(x, ids_est) - 1L
+top80 <- viajes %>% filter(!is.na(Ciclo_Estacion_Retiro)) %>% count(Ciclo_Estacion_Retiro, sort=TRUE) %>%
+ slice_head(n=80) %>% pull(Ciclo_Estacion_Retiro)
+eco_data <- list(
+ meses=format(meses_ctl,"%Y-%m"),
+ mesNombres=paste(meses_es[month(meses_ctl)], year(meses_ctl)),
+ disp=meses_ctl %in% unique(viajes$mes),
+ rango=range(which(meses_ctl %in% unique(viajes$mes))) - 1L,
+ dias=niveles_dias, gen=gen_lv,
+ meta=list(id=meta_est$id, col=meta_est$colonia, alc=meta_est$alcaldia, lat=meta_est$latitud, lon=meta_est$longitud),
+ T=as.data.frame(viajes %>% count(m=mi(mes), d=as.integer(dia_semana), h=hora_retiro_num, name="n")),
+ Dia=as.data.frame(viajes %>% count(f=format(fecha_retiro,"%Y-%m-%d"), m=mi(mes), d=as.integer(dia_semana), name="n") %>% arrange(f)),
+ E=as.data.frame(viajes %>% filter(!is.na(Ciclo_Estacion_Retiro)) %>% count(e=ie(Ciclo_Estacion_Retiro), m=mi(mes), name="n")),
+ A=as.data.frame(viajes %>% filter(!is.na(Ciclo_EstacionArribo)) %>% count(e=ie(Ciclo_EstacionArribo), m=mi(mes), name="n")),
+ EH=as.data.frame(viajes %>% filter(Ciclo_Estacion_Retiro %in% top80) %>%
+  count(e=ie(Ciclo_Estacion_Retiro), m=mi(mes), h=hora_retiro_num, name="n")),
+ Du=as.data.frame(viajes %>% filter(!is.na(duracion_analitica)) %>%
+  count(m=mi(mes), b=floor(duracion_analitica/5)*5, name="n")),
+ G=as.data.frame(viajes %>% filter(!is.na(edad_analitica)) %>%
+  count(m=mi(mes), b=floor(edad_analitica/5)*5, g=match(Genero_Usuario,gen_lv)-1L, name="n")))
+
+```
+
+```{r datos-js, results='asis'}
+js_json <- toJSON(eco_data, dataframe="columns", na="null", digits=6)
+cat("<script>window.ECO=", gsub("</", "<\\/", js_json, fixed=TRUE), ";</script>\n", sep="")
+```
+
+<style>
+body {background:#F3F6F5;color:#263238;font-family:"Segoe UI",Arial,sans-serif;}
+.navbar {background:#174A5B;border-color:#174A5B;}
+.navbar-brand {font-size:17px;}
+.navbar-nav>li>a {font-size:12px;padding-left:11px;padding-right:11px;white-space:normal;}
+.chart-wrapper {border-radius:10px;border:1px solid #DFE7E3;box-shadow:0 3px 10px rgba(23,74,91,.05);margin-bottom:18px;}
+.chart-title {color:#174A5B;font-weight:600;font-size:15px;white-space:normal;overflow:visible;line-height:1.4;height:auto;}
+.chart-stage {padding:18px 22px;}
+.chart-stage p,.chart-stage li {font-size:14px;line-height:1.75;overflow-wrap:anywhere;}
+.chart-stage h4 {color:#174A5B;margin-top:18px;}
+.chart-stage table {width:100%;}
+.chart-stage th,.chart-stage td {padding:9px;vertical-align:top;}
+table.dataTable thead th {background:#174A5B;color:white;white-space:normal;}
+.chart-stage .html-widget {max-width:100%;}
+.chart-stage a {color:#176B3A;}
+@media(max-width:768px){.chart-stage{padding:12px}.chart-stage p{font-size:13px}.navbar-nav>li>a{font-size:13px}}
+
+/* ---- Filtro de meses dentro de una gráfica ---- */
+.ctl-box {max-width:620px;margin:0 auto 10px;padding:10px 14px 8px;background:#F8FAF9;border:1px solid #DFE7E3;border-radius:10px;font-size:12.5px;color:#263238;}
+.ctl-top {display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;gap:8px;flex-wrap:wrap;}
+.ctl-p {font-size:14px;color:#2E9E4F;font-weight:700;}
+.ctl-k {font-size:12px;color:#66757F;} .ctl-k b {color:#174A5B;font-size:14px;}
+.rng {position:relative;height:28px;}
+.rng-track {position:absolute;left:10px;right:10px;top:11px;height:6px;border-radius:3px;background:#D5DEDA;}
+.rng-fill {position:absolute;top:0;bottom:0;background:#2E9E4F;border-radius:3px;}
+.rng input[type=range] {position:absolute;left:0;top:0;width:100%;height:28px;margin:0;padding:0;background:none;
+  pointer-events:none;-webkit-appearance:none;appearance:none;outline:none;}
+.rng input[type=range]::-webkit-slider-runnable-track {background:transparent;height:6px;-webkit-appearance:none;}
+.rng input[type=range]::-moz-range-track {background:transparent;height:6px;}
+.rng input[type=range]::-webkit-slider-thumb {pointer-events:auto;-webkit-appearance:none;width:20px;height:20px;margin-top:-7px;
+  border-radius:50%;background:#2E9E4F;border:3px solid #fff;box-shadow:0 1px 5px rgba(0,0,0,.4);cursor:pointer;}
+.rng input[type=range]::-moz-range-thumb {pointer-events:auto;width:14px;height:14px;border-radius:50%;background:#2E9E4F;
+  border:3px solid #fff;box-shadow:0 1px 5px rgba(0,0,0,.4);cursor:pointer;}
+.ticks {display:flex;padding:0 10px;margin-top:2px;}
+.ticks span {flex:1;text-align:center;font-size:10px;color:#9AA7A2;}
+.ticks span.on {color:#174A5B;font-weight:700;}
+.ticks span.nd {color:#D0D7D4;text-decoration:line-through;}
+.ctl-b {display:flex;gap:6px;margin:10px 0 2px;flex-wrap:wrap;}
+.ctl-b button {border:1px solid #174A5B;background:#fff;color:#174A5B;border-radius:6px;padding:3px 9px;font-size:12px;cursor:pointer;}
+.ctl-b button:hover {background:#174A5B;color:#fff;}
+.ctl-b button.play {background:#2E9E4F;border-color:#2E9E4F;color:#fff;font-weight:600;margin-left:auto;}
+.ctl-n {margin-top:6px;font-size:11px;color:#8A6D3B;background:#FFF8E1;border-radius:6px;padding:4px 8px;}
+.jschart {width:100%;height:410px;}
+.jschart.tall {height:500px;}
+.kpis {display:flex;gap:12px;flex-wrap:wrap;}
+.kpi {flex:1 1 150px;border-radius:10px;padding:10px 14px;background:#F3F6F5;border-left:5px solid #2E9E4F;}
+.kpi:nth-child(2) {border-color:#174A5B;} .kpi:nth-child(3) {border-color:#E76F51;} .kpi:nth-child(4) {border-color:#7A5195;}
+.kpi:nth-child(5) {border-color:#F4A261;} .kpi:nth-child(6) {border-color:#3274A1;}
+.kl {display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#66757F;}
+.kv {display:block;font-size:26px;font-weight:700;color:#174A5B;line-height:1.2;}
+.ks {display:block;font-size:11px;color:#66757F;min-height:14px;}
+.eco-tbl {width:100%;border-collapse:collapse;font-size:12.5px;}
+.eco-tbl th {background:#174A5B;color:#fff;padding:6px 8px;text-align:left;position:sticky;top:0;}
+.eco-tbl td {padding:5px 8px;border-bottom:1px solid #E6ECE9;}
+.eco-tbl tr:nth-child(even) td {background:#F8FAF9;}
+.tblbox {max-height:440px;overflow:auto;}
+</style>
+
+
+# Proyecto
+
+## Row
+
+### Problema, contexto y objetivo
+ECOBICI conecta estaciones mediante viajes que cambian de intensidad según la hora y el territorio. Conocer esas diferencias permite organizar el seguimiento de la operación y distinguir patrones que se pierden al observar únicamente el total anual.
+
+Este proyecto estudia **viajes registrados entre enero y diciembre de 2025**. Su objetivo es describir cuándo y dónde se concentran los retiros, identificar perfiles horarios de estaciones mediante K-Means y evaluar una regresión sencilla de demanda horaria para una estación de alta actividad.
+
+### Pregunta principal e hipótesis
+**¿Cómo varía la demanda de ECOBICI por estación y hora del día durante el periodo analizado, y pueden agruparse las estaciones en perfiles de uso similares que ayuden a identificar periodos de mayor presión operativa?**
+
+La hipótesis de trabajo es que los retiros no se distribuyen homogéneamente entre estaciones ni horas. Se examina mediante distribuciones de demanda y agrupaciones; no se presenta como una hipótesis causal ni como una prueba formal de significancia.
+
+## Row
+
+### Alcance y unidades de análisis
+
+| Elemento | Definición |
+|---|---|
+| Población observada | Viajes registrados en ECOBICI, enero–diciembre de 2025 |
+| Registro original | Viaje con estación y fecha/hora de retiro y arribo |
+| Clustering | Estación, representada por proporciones en las 24 horas |
+| Regresión | Número de retiros por fecha y hora de una estación |
+| Variables | Hora, día de semana, mes, estación y atributos territoriales |
+| Territorio | Estaciones incluidas en los viajes y catálogo disponible |
+
+### Cómo leer el dashboard
+**Demanda** describe el ritmo temporal; **Territorio** identifica concentración; **Balance** describe diferencias de flujos. **Clustering** y **Predicción** muestran qué aportan los modelos y cómo se evalúan. **Conclusiones** reúne la respuesta y sus límites; **Calidad** y **Método** documentan el proceso.
+
+Aquí “demanda” significa viajes efectivamente realizados. No incluye solicitudes que no pudieron atenderse. Edad y género describen viajes por características reportadas, no una muestra de usuarios únicos.
+
+
+# Resumen
+## Row {data-height=170}
+### Indicadores del periodo cargado
+<div class="kpis">
+<div class="kpi"><span class="kl">Viajes</span><span class="kv" id="kpi_viajes">…</span><span class="ks">en el periodo cargado</span></div>
+<div class="kpi"><span class="kl">Promedio diario</span><span class="kv" id="kpi_prom">…</span><span class="ks">días con registros</span></div>
+<div class="kpi"><span class="kl">Hora pico</span><span class="kv" id="kpi_pico">…</span><span class="ks" id="kpi_pico_sub"></span></div>
+<div class="kpi"><span class="kl">Estación líder</span><span class="kv" id="kpi_est">…</span><span class="ks" id="kpi_est_sub"></span></div>
+<div class="kpi"><span class="kl">Duración mediana</span><span class="kv" id="kpi_dur">…</span><span class="ks">1–180 min · por intervalos</span></div>
+<div class="kpi"><span class="kl">Estaciones activas</span><span class="kv" id="kpi_act">…</span><span class="ks">con al menos un retiro</span></div>
+</div>
+
+## Row {data-height=650}
+### Demanda horaria
+<div id="ch_hora" class="jschart tall"></div>
+
+### Estaciones con más retiros · filtra los meses aquí
+<div id="ctl_top10"></div>
+<div id="ch_top10" class="jschart" style="height:380px"></div>
+
+## Row {data-height=470}
+### Evolución mensual
+<div id="ch_mensual" class="jschart"></div>
+
+### Lectura del periodo
+<p id="tx_resumen"></p>
+<p style="color:#66757F;font-size:13px">Usa la barra de meses de la gráfica <b>Estaciones con más retiros</b> (ene → dic 2025) para ver cómo cambia el top 10 mes a mes.</p>
+
+## Row
+### Pregunta y lectura principal
+¿Cómo varía la demanda de ECOBICI por estación y hora durante el periodo analizado, y pueden agruparse las estaciones en perfiles de uso similares que ayuden a identificar periodos de mayor presión operativa?
+
+La hora de mayor retiro global es `r sprintf('%02d:00',hora_pico$hora_retiro_num)`. El modelo identifica `r k_elegido` grupos; su silhouette final es `r round(silueta_final,3)`. La fuerza de esta evidencia debe valorarse junto con los perfiles y la proyección, sin asumir que cualquier partición demuestra grupos naturales.
+
+Los viajes realizados permiten describir patrones y desequilibrios de flujo. No miden personas únicas, disponibilidad instantánea ni demanda no atendida.
+
+El filtro de meses está dentro de la gráfica **Estaciones con más retiros** (página Resumen). El resto del dashboard muestra todos los meses cargados; los modelos se estiman una vez con todos ellos, igual que en el notebook.
+
+# Demanda
+## Row {data-height=470}
+### Viajes diarios
+<div id="ch_diario" class="jschart"></div>
+
+### Promedio de viajes por día con registros, por mes
+<div id="ch_prom_mes" class="jschart"></div>
+
+## Row {data-height=470}
+### Promedio por día de semana
+<div id="ch_dia" class="jschart"></div>
+
+### Día × hora (viajes acumulados)
+<div id="ch_heat_dia" class="jschart"></div>
+
+## Row {data-height=470}
+### Perfil horario: lunes–viernes frente a fin de semana
+<div id="ch_perfil" class="jschart"></div>
+
+### Interpretación temporal
+<p id="tx_demanda"></p>
+Hay `r sum(is.na(diario$n))` días sin registros entre el primer y último día cargados. No se imputan como cero: los promedios por día usan solo días con registro. Un año calendario permite describir variación mensual dentro de 2025, pero no establecer estacionalidad recurrente entre años distintos.
+
+## Row
+
+### Qué aporta esta comparación
+El gráfico mensual de volumen muestra actividad registrada. El promedio por día corrige la distinta duración de los meses; no corrige clima, vacaciones o cambios en la red. El promedio por día de semana evita atribuir mayor uso únicamente a que un día aparece más veces en el calendario.
+
+El heatmap día × hora muestra conteos acumulados: sus celdas identifican franjas de concentración. Se interpreta junto al promedio diario, porque los totales también dependen del número de días observados.
+
+# Territorio
+## Row {data-height=540}
+### Mapa de demanda (tamaño y color = retiros)
+```{r}
+if (nrow(mapa_demanda)) {
+  pal_demanda <- colorNumeric(c("#A8DDB5", verde, azul), mapa_demanda$n)
+  leaflet(mapa_demanda) %>%
+    addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+    setView(-99.16, 19.40, 12) %>%
+    addCircleMarkers(
+      lng = ~longitud, lat = ~latitud,
+      radius = ~rescale(n, c(4, 16)),
+      color = ~pal_demanda(n), stroke = FALSE, fillOpacity = .8,
+      label = ~paste0("Estación ", Ciclo_Estacion_Retiro, " · ", comma(n), " retiros")
+    ) %>%
+    addLegend("bottomright", pal = pal_demanda, values = ~n, title = "Retiros")
+} else cat("No hay coordenadas válidas para mostrar el mapa.")
+```
+
+### Ranking de estaciones
+<div id="tbl_rank" class="tblbox"></div>
+
+## Row {data-height=520}
+### Retiros por alcaldía
+<div id="ch_alc" class="jschart tall"></div>
+
+### Perfiles horarios · 25 estaciones con más retiros
+<div id="ch_heat_est" class="jschart tall"></div>
+
+## Row
+
+### Concentración y comparabilidad espacial
+Las veinte estaciones con más retiros reúnen el `r percent(porcentaje_top20,accuracy=.1)` de los viajes analizados. El ranking muestra volumen; el heatmap muestra la **forma del perfil horario** de cada estación, normalizada por sus propios retiros. Una celda intensa significa una proporción alta de viajes de esa estación, no necesariamente un volumen superior al de otra.
+
+La comparación entre alcaldías refleja viajes vinculados al catálogo. No está ajustada por población, cantidad de estaciones, capacidad ni extensión territorial y no permite afirmar que una alcaldía tenga mayor propensión individual al uso.
+
+# Balance
+## Row {data-height=540}
+### Principales desequilibrios (arribos − retiros)
+<div id="ch_balance" class="jschart tall"></div>
+
+### Detalle de flujos
+<div id="tbl_balance" class="tblbox"></div>
+
+## Row
+### Interpretación operativa
+Balance neto = arribos − retiros. Un valor negativo es compatible con presión hacia déficit; uno positivo, con acumulación. No demuestra que una estación estuviera vacía o llena.
+
+Se cuentan los arribos de viajes iniciados en el periodo, aunque terminen después de su cierre. No se incluyen inventario inicial, anclajes disponibles ni redistribución del operador. Los balances acumulados pueden ocultar presiones opuestas a diferentes horas.
+
+## Row
+
+### Volumen y desequilibrio relativo
+```{r}
+tabla(balance %>% filter(!is.na(estacion),movimientos>0) %>% arrange(desc(movimientos)) %>%
+ select(estacion,movimientos,balance_neto,desequilibrio_relativo) %>%
+ mutate(desequilibrio_relativo=percent(desequilibrio_relativo,accuracy=.1)))
+```
+
+### Por qué se muestran dos indicadores
+El balance absoluto identifica magnitudes de diferencia entre entradas y salidas. El relativo divide esa diferencia por todos los movimientos de la estación y ayuda a contextualizarla según su actividad. En estaciones con pocos viajes puede ser extremo; debe revisarse junto al volumen, sin interpretarlo automáticamente como prioridad de redistribución.
+
+# Viajes
+## Row {data-height=470}
+### Duración
+<div id="ch_dur" class="jschart"></div>
+
+### Edad y código de género
+<div id="ch_edad" class="jschart"></div>
+
+## Row
+### Alcance
+La edad y duración atípicas no eliminan viajes del análisis de demanda: solo se excluyen de estas distribuciones. Las frecuencias corresponden a viajes, no a usuarios únicos. Los códigos de género se mantienen como aparecen en la fuente.
+
+
+# Clustering
+## Row {data-height=80}
+### Nota
+El clustering usa todos los meses cargados.
+
+## Row {data-height=520}
+### Codo
+```{r}
+widget(ggplot(evaluacion_k,aes(k,WSS))+geom_line(color=azul)+geom_point(color=verde)+
+ geom_vline(xintercept=k_elegido,linetype="dashed",color=coral)+scale_x_continuous(breaks=evaluacion_k$k)+labs(x="k",y="Variación intragrupo"))
+```
+### Silhouette
+```{r}
+widget(ggplot(evaluacion_k,aes(k,silueta))+geom_line(color=azul)+geom_point(color=verde)+
+ geom_vline(xintercept=k_elegido,linetype="dashed",color=coral)+scale_x_continuous(breaks=evaluacion_k$k)+labs(x="k",y="Silhouette promedio"))
+```
+## Row {data-height=520}
+### Perfiles medios
+```{r}
+widget(ggplot(perfil_cluster,aes(hora_retiro_num,prop_media,color=cluster))+geom_line(linewidth=1)+
+ scale_color_manual(values=paleta)+scale_y_continuous(labels=percent)+labs(x="Hora",y="Proporción media",color="Grupo"))
+```
+### Proyección de perfiles en dos componentes
+```{r}
+widget(ggplot(pca_df,aes(PC1,PC2,color=cluster))+geom_point(alpha=.7)+
+ scale_color_manual(values=paleta)+labs(color="Grupo",subtitle=paste("Variación representada:",percent(var_pca,accuracy=.1))))
+```
+## Row {data-height=520}
+### Resumen de grupos
+```{r}
+tabla(resumen_clusters %>% mutate(proporcion_pico=percent(proporcion_pico,accuracy=.1)))
+```
+### Composición de grupos por alcaldía
+```{r}
+widget(ggplot(clusters_alcaldia,aes(str_wrap(alcaldia,20),n,fill=cluster))+geom_col(position="fill")+coord_flip()+
+ scale_fill_manual(values=paleta)+scale_y_continuous(labels=percent)+labs(x=NULL,y="Proporción de estaciones",fill="Grupo"))
+```
+## Row
+### Qué aporta el modelo
+K-Means agrupa estaciones con al menos 50 retiros según 24 proporciones horarias; no agrupa directamente por volumen. Se excluyen horas sin variación y no se estandarizan las restantes. Se comparan soluciones de 2 a `r k_max` grupos por silhouette y se contrasta con el codo.
+
+El ajuste final utiliza 50 inicializaciones. La silhouette del ajuste final es `r round(silueta_final,3)`; puede diferir de la utilizada para seleccionar k porque el ajuste se repite. La PCA es una proyección descriptiva. No asignamos motivos laborales, escolares o recreativos sin variables externas.
+
+## Row
+
+### Lectura detallada de los grupos
+```{r}
+tabla(cluster_descripcion %>% select(cluster,n_estaciones,hora_pico,proporcion_pico,manana_6_10,tarde_16_20) %>%
+ mutate(across(c(proporcion_pico,manana_6_10,tarde_16_20),~percent(.x,accuracy=.1))))
+```
+
+### Cómo interpretar la agrupación
+Cada curva es el promedio de las proporciones de las estaciones de un grupo: todas pesan igual, independientemente de su volumen. La concentración entre 06:00–10:59 y 16:00–20:59 ayuda a comparar franjas amplias, además de una hora pico aislada.
+
+Silhouette cercana a cero indica perfiles fronterizos o poca separación; valores negativos indican asignaciones que pueden ser más próximas a otro grupo. Elegir el máximo entre las opciones no garantiza una separación fuerte. La composición territorial describe asociaciones; no identifica por sí sola causas urbanas ni motivos de viaje.
+
+# Mapa de grupos
+## Row {data-height=520}
+### Distribución geográfica de perfiles
+```{r}
+if(nrow(mapa_cluster)) {
+ pal_c <- colorFactor(paleta[seq_len(k_elegido)],levels=levels(perfil_horario$cluster))
+ leaflet(mapa_cluster) %>% addProviderTiles(providers$Esri.WorldGrayCanvas) %>% setView(-99.16,19.40,12) %>%
+ addCircleMarkers(lng=~longitud,lat=~latitud,radius=6,color=~pal_c(cluster),stroke=FALSE,fillOpacity=.8,
+ label=~paste0("Estación ",Ciclo_Estacion_Retiro," · Grupo ",cluster)) %>%
+ addLegend("bottomright",pal=pal_c,values=~cluster,title="Grupo")
+} else cat("No hay coordenadas válidas para los grupos.")
+```
+
+# Predicción
+## Row {data-height=80}
+### Nota
+La regresión usa todos los meses cargados (80% inicial para entrenar).
+
+## Row {data-height=520}
+### Comparación fuera de muestra
+```{r}
+tabla(metricas_modelos %>% mutate(across(where(is.numeric),~round(.x,3))))
+```
+### Demanda diaria observada y predicha en prueba
+```{r}
+widget(ggplot(pred_diaria,aes(fecha_retiro,Viajes,color=Serie))+geom_line()+labs(x=NULL,y="Suma diaria de predicciones horarias",color=NULL))
+```
+## Row {data-height=520}
+### Real frente a predicho por hora
+```{r}
+widget(ggplot(test,aes(viajes,pred))+geom_point(alpha=.25,color=azul)+
+ geom_abline(slope=1,intercept=0,color=coral,linetype="dashed")+labs(x="Viajes observados",y="Viajes predichos"))
+```
+### Errores por hora
+```{r}
+widget(ggplot(test,aes(factor(hora_retiro_num),residual))+geom_boxplot(fill="#A8DDB5",outlier.alpha=.2)+
+ geom_hline(yintercept=0,color=coral)+labs(x="Hora",y="Observado − predicho"))
+```
+## Row {data-height=520}
+### Diferencias estimadas respecto a las 00:00
+```{r}
+widget(ggplot(coefs_hora,aes(hora,estimate))+geom_col(fill=azul)+
+ geom_errorbar(aes(ymin=estimate-std.error,ymax=estimate+std.error),width=.2)+
+ labs(x="Hora",y="Diferencia estimada de viajes",subtitle="Barras: ±1 error estándar; asociación, no efecto causal"))
+```
+### Diseño de evaluación
+Se modela la estación `r top_estacion`, seleccionada por el mayor número de retiros del periodo cargado, igual que en el notebook. El corte utiliza el 80% inicial de las fechas de la serie: entrenamiento hasta `r format(fecha_corte,"%d/%m/%Y")` y prueba desde `r format(min(test$fecha_retiro),"%d/%m/%Y")`. Se comparan hora lineal + día de semana y hora categórica + día de semana. Las predicciones negativas se truncan a cero y las métricas se calculan después de ese truncamiento.
+
+MAE y RMSE se expresan en viajes por hora. R² de prueba puede ser negativo: significaría que el error supera el de usar la media observada de prueba como referencia retrospectiva.
+
+Como en el notebook, las combinaciones fecha–hora sin viajes se completan con cero entre el primer y último registro de la estación. Esto presupone cobertura continua y no distingue cierre, falta de datos o falta de bicicletas. La selección de estación usa el año completo: aunque los coeficientes se ajustan solo con entrenamiento, la selección es retrospectiva. Una evaluación operativa futura debería seleccionar la estación solo con datos previos y verificar cobertura.
+
+## Row
+
+### Resultado comparativo del modelo
+La especificación categórica obtiene **RMSE = `r round(rmse_categoria,2)`** y **MAE = `r round(mae_categoria,2)` viajes por hora**, con **R² en prueba = `r round(r2_categoria,3)`**. Frente a la hora lineal, el cambio relativo de RMSE es `r if(is.finite(mejora_rmse)) paste0(round(mejora_rmse,1),"%") else "no calculable"`; un valor positivo representa reducción del error y uno negativo, aumento.
+
+El gráfico diario suma predicciones horarias para facilitar su lectura. Las métricas se calculan a nivel horario: no deben confundirse con errores diarios. Los coeficientes comparan cada hora con las 00:00, manteniendo el día de semana; expresan asociación ajustada, no efecto causal. Sus barras son ±1 error estándar, no intervalos de confianza del 95%.
+
+### Qué queda fuera del modelo
+La regresión aditiva permite un patrón horario y diferencias de nivel por día de semana, pero no una curva horaria distinta para cada día. No incorpora tendencia, clima, festivos ni disponibilidad. Los errores pueden estar correlacionados en el tiempo y el modelo lineal no representa explícitamente una distribución de conteos.
+
+Una continuación útil sería comparar interacciones hora × día, un modelo de conteo y validación temporal con varios cortes. El periodo de prueba debe mantenerse fuera de las decisiones de ajuste si se busca una evaluación final independiente.
+
+# Conclusiones
+
+## Row
+
+### Respuesta a la pregunta principal
+En el periodo analizado el máximo acumulado de retiros ocurre a las **`r sprintf('%02d:00',hora_pico$hora_retiro_num)`**, que concentra el **`r percent(pct_hora_pico,accuracy=.1)`** del total. La estación **`r estacion_top$Ciclo_Estacion_Retiro`** encabeza los retiros. Estos resultados responden a cuándo y dónde se observa mayor actividad, sin medir viajes que no pudieron realizarse.
+
+K-Means sintetiza las estaciones elegibles en **`r k_elegido` perfiles**, con silhouette final **`r round(silueta_final,3)`**. Su aporte es comparar formas horarias independientemente del volumen. La interpretación sustantiva depende de las curvas, la separación y la composición de los grupos, no únicamente del número seleccionado.
+
+### Aporte predictivo y utilidad operativa
+La regresión categórica establece una referencia cuantitativa para la estación **`r top_estacion`**. Su MAE fuera de muestra es **`r round(mae_categoria,2)` viajes por hora**. La comparación con la especificación lineal permite valorar si representar cada hora por separado mejora la aproximación de los picos.
+
+Los perfiles pueden orientar qué franjas conviene vigilar en diferentes estaciones. Los balances pueden apoyar una revisión de flujos. Para proponer redistribución efectiva se necesitarían inventario, anclajes, movimientos del operador y costos; este proyecto no calcula una asignación óptima de bicicletas.
+
+## Row
+
+### Limitaciones y extensiones prioritarias
+**Cobertura:** los viajes observados pueden omitir periodos por fallas de captura; el catálogo puede ser posterior a los viajes. **Alcance:** un año describe variación mensual, sin establecer estacionalidad entre años. **Operación:** no hay inventario instantáneo ni demanda no atendida.
+
+**Modelos:** K-Means favorece grupos compactos y los perfiles no son categorías permanentes. La regresión se evalúa con un solo corte y la selección de estación es retrospectiva. Los ceros completados requieren revisar cobertura real.
+
+Las extensiones prioritarias son: verificar operación y capacidad por estación, incorporar clima y festivos, evaluar estabilidad del clustering por subperiodos y comparar modelos mediante validación temporal. Deben añadirse porque resuelvan una pregunta, no solo para ampliar el número de técnicas.
+
+# Calidad
+## Row {data-height=520}
+### Controles de la base analítica
+```{r}
+controles <- tibble(Control=c("Viajes analíticos","Duración sin dato válido (1–180 min)",
+ "Edad sin dato válido (12–90 años)","Retiro sin ID","Arribo sin ID","Viajes sin alcaldía","Días sin registros"),
+ Cantidad=c(n_final,sum(is.na(viajes$duracion_analitica)),sum(is.na(viajes$edad_analitica)),
+ sum(is.na(viajes$Ciclo_Estacion_Retiro)),sum(is.na(viajes$Ciclo_EstacionArribo)),
+ sum(is.na(viajes$alcaldia)),sum(is.na(diario$n))))
+tabla(controles)
+```
+### Trazabilidad de limpieza
+```{r}
+tabla(calidad_cruda)
+```
+## Row
+### Respuesta y límites
+El análisis describe cómo se distribuyen los retiros en tiempo y territorio. El clustering resume perfiles de estaciones; la regresión establece una referencia de demanda horaria para una estación de alta actividad y mide su error fuera de muestra.
+
+Las conclusiones finales deben valorar las métricas y perfiles obtenidos: la presencia de grupos o un R² alto dentro de entrenamiento no garantizan separación sólida ni precisión futura. El balance aporta señales de desequilibrio, sin demostrar desabasto o saturación.
+
+Un año permite describir variación mensual, pero no confirmar patrones recurrentes entre años. Faltan inventario, capacidad, clima, festivos, uso de suelo y movimientos de redistribución. La población observada son viajes realizados; no mide viajes que se intentaron pero no pudieron efectuarse.
+
+# Método
+
+## Row {data-height=520}
+
+### Datos y pregunta
+La base combina los doce archivos mensuales de ECOBICI de 2025 con el catálogo de estaciones (colonia, alcaldía, latitud y longitud). Se eligió un año calendario completo para no mezclar periodos con posibles diferencias de captura entre años y mantener un volumen manejable: `r origen`.
+
+**¿Cómo varía la demanda de ECOBICI por estación y hora del día durante 2025, y pueden agruparse las estaciones en perfiles de uso similares que ayuden a identificar periodos de mayor presión operativa?** La unidad de registro es el viaje. Para el clustering, cada estación se representa como un vector de 24 proporciones horarias de retiro; para la regresión, la unidad es estación × fecha × hora, con el número de retiros como variable a explicar.
+
+### Preparación de los datos
+Los archivos se leen con `colClasses = "character"` para evitar que los doce CSV, que no siempre comparten tipos de columna, produzcan errores al unirse. A partir de ahí: edad se convierte a numérico y bicicleta se conserva como texto (es un identificador, no una cantidad); se eliminan los duplicados exactos; fecha y hora se interpretan en formato día-mes-año y los registros que no pudieron interpretarse se descartan, igual que los viajes fuera de 2025.
+
+Duración fuera de 1–180 minutos y edad fuera de 12–90 años no eliminan el viaje de los conteos de demanda: solo se excluyen de las gráficas donde esa variable específica es relevante. Género se conserva como M, F u O, y lo no identificado se agrupa como "No especificado". Los IDs de estación se recortan de espacios para que el `left_join` con el catálogo no falle por inconsistencias de formato.
+
+## Row
+
+### Clustering de estaciones
+Cada estación con al menos 50 retiros en el año se representa por su perfil horario normalizado (24 proporciones que suman 1). Las horas sin variación entre estaciones se excluyen antes del ajuste, porque no aportan distancia y producen una proyección inestable al graficar los clusters en dos componentes principales.
+
+El número de grupos se eligió comparando el método del codo con la silueta promedio para soluciones de 2 a `r k_max`; ambos criterios coincidieron en **`r k_elegido` grupos**, con silueta final de **`r round(silueta_final,3)`**. El ajuste reportado usa 50 inicializaciones aleatorias. K-Means agrupa por la forma del perfil horario, no por el volumen de cada estación.
+
+### Regresión complementaria
+Como complemento al clustering se modela la estación con más retiros en el año (`r top_estacion`), seleccionada de forma retrospectiva. El objetivo es establecer una línea base, no un modelo de pronóstico operativo: se compara una especificación con la hora como variable lineal contra otra con la hora como variable categórica, ambas con el día de la semana como control.
+
+La separación es cronológica: el 80% inicial de las fechas (hasta `r format(fecha_corte,"%d/%m/%Y")`) se usa para entrenar y el 20% final para evaluar, de modo que ninguna predicción usa información posterior a la observación que explica. Las combinaciones fecha-hora sin viajes registrados se completan con cero; esto da cobertura continua a la serie pero no distingue un cierre real de la estación de la ausencia de datos.
+
+
+
+<script>
+(function () {
+  'use strict';
+  var D = window.ECO;
+  if (!D) { return; }
+
+  /* ---------- Constantes y utilidades ---------- */
+  var VERDE = '#2E9E4F', AZUL = '#174A5B', CORAL = '#E76F51', GRIS = '#CBD5D1';
+  var PALETA_G = ['#2E9E4F', '#3274A1', '#F4A261', '#7A5195'];
+  var NM = D.meses.length;
+  var MES_ABR = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+  var st = { a: D.rango[0], b: D.rango[1] };
+  var S = null;
+  var timer = null, rangoPrevio = null;
+
+  function arr(x) { return Array.isArray(x) ? x : (x === undefined || x === null ? [] : [x]); }
+  function fmt(n) { return Math.round(n).toLocaleString('es-MX'); }
+  function fmt1(n) { return Number(n).toLocaleString('es-MX', { minimumFractionDigits: 1, maximumFractionDigits: 1 }); }
+  function pct(x, d) { return (100 * x).toFixed(d === undefined ? 1 : d) + '%'; }
+  function zeros(n) { var a = [], i; for (i = 0; i < n; i++) { a.push(0); } return a; }
+  function inR(m) { return m >= st.a && m <= st.b; }
+  function sum(a) { var s = 0, i; for (i = 0; i < a.length; i++) { s += a[i]; } return s; }
+  function argmax(a) { var k = 0, i; for (i = 1; i < a.length; i++) { if (a[i] > a[k]) { k = i; } } return k; }
+  function hh(h) { return (h < 10 ? '0' : '') + h + ':00'; }
+  function mesLab(i) {
+    var p = D.meses[i].split('-');
+    return MES_ABR[parseInt(p[1], 10) - 1] + ' ' + p[0];
+  }
+  function mesLargo(i) { return D.mesNombres[i]; }
+  function inicioMes(i) { return D.meses[i] + '-01'; }
+  function finMes(i) {
+    var p = D.meses[i].split('-'), y = parseInt(p[0], 10), m = parseInt(p[1], 10);
+    var d = new Date(Date.UTC(y, m, 1));
+    return d.getUTCFullYear() + '-' + ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-01';
+  }
+  function cortar(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+  function lab(e) {
+    var c = D.meta.col[e];
+    return D.meta.id[e] + (c ? ' · ' + c : '');
+  }
+  function el(id) { return document.getElementById(id); }
+  function setHTML(id, html) { var e = el(id); if (e) { e.innerHTML = html; } }
+  function periodoTxt() {
+    return st.a === st.b ? mesLargo(st.a) : mesLab(st.a) + ' – ' + mesLab(st.b);
+  }
+
+  /* ---------- Agregaciones para el periodo elegido ---------- */
+  function calc(ra, rb) {
+    function ir(m) { return m >= ra && m <= rb; }
+    var s = {}, i, k, e, m;
+    var T = D.T, nT = arr(T.m).length, Tm = arr(T.m), Td = arr(T.d), Th = arr(T.h), Tn = arr(T.n);
+    s.hora = zeros(24); s.dh = []; s.mesTot = zeros(NM);
+    for (k = 0; k < 7; k++) { s.dh.push(zeros(24)); }
+    for (i = 0; i < nT; i++) {
+      m = Tm[i]; s.mesTot[m] += Tn[i];
+      if (ir(m)) { s.hora[Th[i]] += Tn[i]; s.dh[Td[i] - 1][Th[i]] += Tn[i]; }
+    }
+    s.total = sum(s.hora);
+
+    var Dm = arr(D.Dia.m), Dd = arr(D.Dia.d), Dn = arr(D.Dia.n);
+    s.diasMes = zeros(NM); s.diaSum = zeros(7); s.diaCnt = zeros(7); s.diasRango = 0;
+    for (i = 0; i < Dm.length; i++) {
+      s.diasMes[Dm[i]] += 1;
+      if (ir(Dm[i])) { s.diaSum[Dd[i] - 1] += Dn[i]; s.diaCnt[Dd[i] - 1] += 1; s.diasRango += 1; }
+    }
+
+    var ne = arr(D.meta.id).length;
+    s.Et = zeros(ne); s.At = zeros(ne);
+    var Ee = arr(D.E.e), Em = arr(D.E.m), En = arr(D.E.n);
+    for (i = 0; i < Ee.length; i++) { if (ir(Em[i])) { s.Et[Ee[i]] += En[i]; } }
+    var Ae = arr(D.A.e), Am = arr(D.A.m), An = arr(D.A.n);
+    for (i = 0; i < Ae.length; i++) { if (ir(Am[i])) { s.At[Ae[i]] += An[i]; } }
+
+    var H = {}, Hm = arr(D.EH.m), He = arr(D.EH.e), Hh = arr(D.EH.h), Hn = arr(D.EH.n);
+    for (i = 0; i < Hm.length; i++) {
+      if (ir(Hm[i])) {
+        e = He[i];
+        if (!H[e]) { H[e] = zeros(24); }
+        H[e][Hh[i]] += Hn[i];
+      }
+    }
+    s.EH = H;
+
+    var bins = {}, Um = arr(D.Du.m), Ub = arr(D.Du.b), Un = arr(D.Du.n);
+    s.durTot = 0;
+    for (i = 0; i < Um.length; i++) {
+      if (ir(Um[i])) { bins[Ub[i]] = (bins[Ub[i]] || 0) + Un[i]; s.durTot += Un[i]; }
+    }
+    s.durBins = bins;
+    var ks = Object.keys(bins).map(Number).sort(function (x, y) { return x - y; });
+    s.durMed = null;
+    if (s.durTot > 0) {
+      var acum = 0, mitad = s.durTot / 2;
+      for (i = 0; i < ks.length; i++) {
+        var c = bins[ks[i]];
+        if (acum + c >= mitad) { s.durMed = ks[i] + 5 * (mitad - acum) / c; break; }
+        acum += c;
+      }
+    }
+
+    var G = {}, Gm = arr(D.G.m), Gb = arr(D.G.b), Gg = arr(D.G.g), Gn = arr(D.G.n);
+    for (i = 0; i < Gm.length; i++) {
+      if (ir(Gm[i])) {
+        var key = Gg[i];
+        if (!G[key]) { G[key] = {}; }
+        G[key][Gb[i]] = (G[key][Gb[i]] || 0) + Gn[i];
+      }
+    }
+    s.G = G;
+    return s;
+  }
+
+  /* ---------- Dibujo ---------- */
+  var FONT = { family: 'Segoe UI, Arial, sans-serif', size: 12, color: '#263238' };
+  function layout(extra) {
+    var l = {
+      font: FONT, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+      margin: { l: 60, r: 20, t: 18, b: 52 }, autosize: true, showlegend: false,
+      hoverlabel: { font: { size: 12 } },
+      xaxis: { gridcolor: '#E6ECE9', zerolinecolor: '#E6ECE9', automargin: true },
+      yaxis: { gridcolor: '#E6ECE9', zerolinecolor: '#E6ECE9', automargin: true }
+    };
+    var k, j;
+    for (k in extra) {
+      if (extra.hasOwnProperty(k)) {
+        if (typeof extra[k] === 'object' && !Array.isArray(extra[k]) && l[k] && typeof l[k] === 'object') {
+          for (j in extra[k]) { if (extra[k].hasOwnProperty(j)) { l[k][j] = extra[k][j]; } }
+        } else { l[k] = extra[k]; }
+      }
+    }
+    return l;
+  }
+  var CFG = { displayModeBar: false, responsive: true };
+  function vacio() {
+    return {
+      traces: [],
+      lay: layout({
+        xaxis: { visible: false }, yaxis: { visible: false },
+        annotations: [{ text: 'Sin viajes en el periodo seleccionado', showarrow: false, xref: 'paper', yref: 'paper', x: 0.5, y: 0.5, font: { size: 14, color: '#66757F' } }]
+      })
+    };
+  }
+
+  var charts = {};   // id -> función que devuelve {traces, lay}
+  var dibujado = {}; // id -> true si ya se pintó
+  var pendiente = {};
+
+  function visible(e) { return e && e.offsetParent !== null && e.offsetWidth > 0; }
+  function pintar(id) {
+    var e = el(id);
+    if (!e || !charts[id] || typeof Plotly === 'undefined') { return; }
+    var Sx = (charts[id].local && W[charts[id].local]) ? W[charts[id].local].S : S;
+    var r = (Sx.total === 0 && !charts[id].siempre) ? vacio() : charts[id]();
+    Plotly.react(e, r.traces, r.lay, CFG);
+    dibujado[id] = true; pendiente[id] = false;
+  }
+  function refrescar() {
+    var id;
+    for (id in charts) {
+      if (charts.hasOwnProperty(id)) {
+        var e = el(id);
+        if (visible(e)) { pintar(id); } else { pendiente[id] = true; }
+      }
+    }
+  }
+  function redimensionar() {
+    var id, e;
+    for (id in charts) {
+      if (charts.hasOwnProperty(id)) {
+        e = el(id);
+        if (visible(e)) {
+          if (pendiente[id] || !dibujado[id]) { pintar(id); } else { try { Plotly.Plots.resize(e); } catch (x) { /* nada */ } }
+        }
+      }
+    }
+  }
+
+  /* ---------- Definición de gráficas ---------- */
+  var horas = []; (function () { for (var i = 0; i < 24; i++) { horas.push(i); } })();
+
+  charts.ch_hora = function () {
+    var pico = argmax(S.hora);
+    return {
+      traces: [{
+        type: 'bar', x: horas, y: S.hora,
+        marker: { color: horas.map(function (h) { return h === pico ? CORAL : VERDE; }) },
+        hovertemplate: '%{x}:00 h<br>%{y:,.0f} retiros<extra></extra>'
+      }],
+      lay: layout({ xaxis: { title: 'Hora de retiro', dtick: 2 }, yaxis: { title: 'Retiros', tickformat: ',' } })
+    };
+  };
+
+  function topEst(arrVal, n) {
+    var idx = [], i;
+    for (i = 0; i < arrVal.length; i++) { if (arrVal[i] > 0) { idx.push(i); } }
+    idx.sort(function (x, y) { return arrVal[y] - arrVal[x]; });
+    return idx.slice(0, n);
+  }
+
+  var W = {};   // filtros locales (uno por gráfica que lo tenga)
+  charts.ch_top10 = function () {
+    var SS = (W.top10 && W.top10.S) || S;
+    var t = topEst(SS.Et, 10).reverse();
+    return {
+      traces: [{
+        type: 'bar', orientation: 'h', x: t.map(function (e) { return SS.Et[e]; }),
+        y: t.map(function (e) { return cortar(lab(e), 30); }), marker: { color: AZUL },
+        hovertemplate: '%{y}<br>%{x:,.0f} retiros<extra></extra>'
+      }],
+      lay: layout({ margin: { l: 190 }, xaxis: { title: 'Retiros', tickformat: ',' } })
+    };
+  };
+
+  charts.ch_top10.local = 'top10';
+
+  charts.ch_mensual = function () {
+    var x = [], y = [], col = [], i;
+    for (i = 0; i < NM; i++) {
+      x.push(mesLab(i)); y.push(D.disp[i] ? S.mesTot[i] : 0);
+      col.push(!D.disp[i] ? '#EEF2F0' : (inR(i) ? VERDE : GRIS));
+    }
+    return {
+      traces: [{ type: 'bar', x: x, y: y, marker: { color: col }, customdata: x.map(function (_, j) { return j; }),
+        hovertemplate: '%{x}<br>%{y:,.0f} viajes<extra></extra>' }],
+      lay: layout({ xaxis: { tickangle: -40, type: 'category' }, yaxis: { title: 'Viajes', tickformat: ',' } })
+    };
+  };
+  charts.ch_mensual.siempre = true;
+
+  charts.ch_prom_mes = function () {
+    var x = [], y = [], col = [], i;
+    for (i = 0; i < NM; i++) {
+      x.push(mesLab(i));
+      y.push(D.disp[i] && S.diasMes[i] > 0 ? S.mesTot[i] / S.diasMes[i] : null);
+      col.push(inR(i) ? VERDE : GRIS);
+    }
+    return {
+      traces: [{ type: 'scatter', mode: 'lines+markers', x: x, y: y, connectgaps: false,
+        line: { color: AZUL, width: 2 }, marker: { color: col, size: 10, line: { color: AZUL, width: 1 } },
+        hovertemplate: '%{x}<br>%{y:,.0f} viajes/día<extra></extra>' }],
+      lay: layout({ xaxis: { tickangle: -40, type: 'category' }, yaxis: { title: 'Viajes por día con registros', tickformat: ',' } })
+    };
+  };
+  charts.ch_prom_mes.siempre = true;
+
+  charts.ch_diario = function () {
+    var f = arr(D.Dia.f), n = arr(D.Dia.n);
+    return {
+      traces: [{ type: 'scatter', mode: 'lines', x: f, y: n, line: { color: AZUL, width: 1.4 },
+        hovertemplate: '%{x}<br>%{y:,.0f} viajes<extra></extra>' }],
+      lay: layout({
+        xaxis: { range: [inicioMes(0), finMes(NM - 1)], type: 'date' },
+        yaxis: { title: 'Viajes por día', tickformat: ',' },
+        shapes: [{ type: 'rect', xref: 'x', yref: 'paper', x0: inicioMes(st.a), x1: finMes(st.b), y0: 0, y1: 1,
+          fillcolor: 'rgba(46,158,79,0.15)', line: { width: 0 } }]
+      })
+    };
+  };
+  charts.ch_diario.siempre = true;
+
+  charts.ch_dia = function () {
+    var y = S.diaSum.map(function (v, i) { return S.diaCnt[i] > 0 ? v / S.diaCnt[i] : 0; });
+    var mx = argmax(y);
+    return {
+      traces: [{ type: 'bar', x: D.dias, y: y, marker: { color: y.map(function (_, i) { return i === mx ? CORAL : AZUL; }) },
+        hovertemplate: '%{x}<br>%{y:,.0f} viajes/día<extra></extra>' }],
+      lay: layout({ yaxis: { title: 'Promedio de viajes por día', tickformat: ',' } })
+    };
+  };
+
+  charts.ch_heat_dia = function () {
+    return {
+      traces: [{ type: 'heatmap', x: horas, y: D.dias, z: S.dh, colorscale: [[0, '#D8F3DC'], [1, AZUL]],
+        colorbar: { title: 'Viajes', thickness: 12 }, hovertemplate: '%{y} · %{x}:00 h<br>%{z:,.0f} viajes<extra></extra>' }],
+      lay: layout({ xaxis: { title: 'Hora', dtick: 2 }, yaxis: { autorange: 'reversed' }, margin: { r: 10 } })
+    };
+  };
+
+  charts.ch_perfil = function () {
+    var lab5 = zeros(24), fin = zeros(24), i;
+    for (i = 0; i < 24; i++) {
+      lab5[i] = S.dh[0][i] + S.dh[1][i] + S.dh[2][i] + S.dh[3][i] + S.dh[4][i];
+      fin[i] = S.dh[5][i] + S.dh[6][i];
+    }
+    var tl = sum(lab5) || 1, tf = sum(fin) || 1;
+    return {
+      traces: [
+        { type: 'scatter', mode: 'lines+markers', name: 'Lunes a viernes', x: horas, y: lab5.map(function (v) { return v / tl; }),
+          line: { color: AZUL, width: 2.5 }, hovertemplate: '%{x}:00 h<br>%{y:.1%}<extra>Lun–vie</extra>' },
+        { type: 'scatter', mode: 'lines+markers', name: 'Sábado y domingo', x: horas, y: fin.map(function (v) { return v / tf; }),
+          line: { color: CORAL, width: 2.5 }, hovertemplate: '%{x}:00 h<br>%{y:.1%}<extra>Fin de semana</extra>' }
+      ],
+      lay: layout({ showlegend: true, legend: { orientation: 'h', y: -0.28 },
+        xaxis: { title: 'Hora de retiro', dtick: 2 }, yaxis: { title: '% de los viajes del grupo', tickformat: '.0%' } })
+    };
+  };
+
+  charts.ch_alc = function () {
+    var g = {}, e, k;
+    for (e = 0; e < S.Et.length; e++) {
+      var a = D.meta.alc[e];
+      if (a && S.Et[e] > 0) { g[a] = (g[a] || 0) + S.Et[e]; }
+    }
+    var ks = Object.keys(g).sort(function (x, y) { return g[x] - g[y]; });
+    return {
+      traces: [{ type: 'bar', orientation: 'h', x: ks.map(function (k2) { return g[k2]; }), y: ks, marker: { color: AZUL },
+        hovertemplate: '%{y}<br>%{x:,.0f} retiros<extra></extra>' }],
+      lay: layout({ margin: { l: 150 }, xaxis: { title: 'Retiros vinculados al catálogo', tickformat: ',' } })
+    };
+  };
+
+  charts.ch_heat_est = function () {
+    var cand = Object.keys(S.EH).map(Number);
+    cand.sort(function (x, y) { return sum(S.EH[y]) - sum(S.EH[x]); });
+    cand = cand.slice(0, 25);
+    var z = cand.map(function (e) { var t = sum(S.EH[e]) || 1; return S.EH[e].map(function (v) { return v / t; }); });
+    var y = cand.map(function (e) { return D.meta.id[e]; });
+    return {
+      traces: [{ type: 'heatmap', x: horas, y: y.slice().reverse(), z: z.slice().reverse(),
+        colorscale: [[0, '#D8F3DC'], [1, AZUL]], colorbar: { title: '% de la estación', tickformat: '.0%', thickness: 12 },
+        hovertemplate: 'Estación %{y} · %{x}:00 h<br>%{z:.1%}<extra></extra>' }],
+      lay: layout({ xaxis: { title: 'Hora', dtick: 2 }, yaxis: { type: 'category', title: 'Estación' }, margin: { l: 70, r: 10 } })
+    };
+  };
+
+  function balanceIdx(n) {
+    var idx = [], e, bal = [];
+    for (e = 0; e < S.Et.length; e++) { if (S.Et[e] + S.At[e] > 0) { idx.push(e); } }
+    idx.sort(function (x, y) { return Math.abs(S.At[y] - S.Et[y]) - Math.abs(S.At[x] - S.Et[x]); });
+    return idx.slice(0, n);
+  }
+  charts.ch_balance = function () {
+    var t = balanceIdx(20).sort(function (x, y) { return (S.At[x] - S.Et[x]) - (S.At[y] - S.Et[y]); });
+    var v = t.map(function (e) { return S.At[e] - S.Et[e]; });
+    return {
+      traces: [{ type: 'bar', orientation: 'h', x: v, y: t.map(function (e) { return cortar(lab(e), 30); }),
+        marker: { color: v.map(function (q) { return q > 0 ? VERDE : CORAL; }) },
+        hovertemplate: '%{y}<br>Arribos − retiros: %{x:,.0f}<extra></extra>' }],
+      lay: layout({ margin: { l: 190 }, xaxis: { title: 'Arribos − retiros', tickformat: ',' } })
+    };
+  };
+
+  charts.ch_dur = function () {
+    var ks = Object.keys(S.durBins).map(Number).sort(function (a, b) { return a - b; });
+    return {
+      traces: [{ type: 'bar', x: ks.map(function (k) { return k + 2.5; }), y: ks.map(function (k) { return S.durBins[k]; }),
+        width: 4.8, marker: { color: VERDE },
+        hovertemplate: 'Intervalo de 5 min<br>%{y:,.0f} viajes<extra></extra>' }],
+      lay: layout({ xaxis: { title: 'Duración (min, intervalos de 5)' }, yaxis: { title: 'Viajes', tickformat: ',' } })
+    };
+  };
+
+  charts.ch_edad = function () {
+    var tr = [], g;
+    for (g = 0; g < D.gen.length; g++) {
+      if (!S.G[g]) { continue; }
+      var ks = Object.keys(S.G[g]).map(Number).sort(function (a, b) { return a - b; });
+      tr.push({ type: 'bar', name: D.gen[g], x: ks.map(function (k) { return k + 2.5; }), y: ks.map(function (k) { return S.G[g][k]; }),
+        width: 4.8, marker: { color: PALETA_G[g % 4] }, hovertemplate: D.gen[g] + '<br>%{y:,.0f} viajes<extra></extra>' });
+    }
+    return {
+      traces: tr,
+      lay: layout({ barmode: 'stack', showlegend: true, legend: { orientation: 'h', y: -0.28 },
+        xaxis: { title: 'Edad (intervalos de 5 años)' }, yaxis: { title: 'Viajes', tickformat: ',' } })
+    };
+  };
+
+  /* ---------- Texto, KPI y tablas ---------- */
+  function tabla(head, rows) {
+    var h = '<table class="eco-tbl"><thead><tr>' + head.map(function (x) { return '<th>' + x + '</th>'; }).join('') + '</tr></thead><tbody>';
+    rows.forEach(function (r) { h += '<tr>' + r.map(function (x) { return '<td>' + x + '</td>'; }).join('') + '</tr>'; });
+    return h + '</tbody></table>';
+  }
+
+  function actualizarTextos() {
+    var tot = S.total, i;
+    var nm = 0;
+    for (i = st.a; i <= st.b; i++) { if (D.disp[i]) { nm++; } }
+    var pico = argmax(S.hora);
+    var topE = topEst(S.Et, 1)[0];
+    var top20 = topEst(S.Et, 20), sT20 = 0;
+    top20.forEach(function (e) { sT20 += S.Et[e]; });
+    var activas = 0; S.Et.forEach(function (v) { if (v > 0) { activas++; } });
+    var prom = S.diasRango > 0 ? tot / S.diasRango : 0;
+
+    setHTML('kpi_viajes', fmt(tot));
+    setHTML('kpi_prom', fmt(prom));
+    setHTML('kpi_pico', tot ? hh(pico) : '—');
+    setHTML('kpi_pico_sub', tot ? pct(S.hora[pico] / tot) + ' de los viajes' : '');
+    setHTML('kpi_est', tot && topE !== undefined ? D.meta.id[topE] : '—');
+    setHTML('kpi_est_sub', tot && topE !== undefined ? cortar(D.meta.col[topE] || '', 26) + (topE !== undefined ? ' · ' + fmt(S.Et[topE]) : '') : '');
+    setHTML('kpi_dur', S.durMed !== null ? '≈ ' + fmt1(S.durMed) + ' min' : '—');
+    setHTML('kpi_act', fmt(activas));
+
+    var txt;
+    if (!tot) {
+      txt = 'No hay viajes registrados en el periodo seleccionado (' + periodoTxt() + '). ';
+    } else {
+      var best = -1, worst = -1, bi = 0, wi = 0;
+      for (i = st.a; i <= st.b; i++) {
+        if (D.disp[i]) {
+          if (best < 0 || S.mesTot[i] > best) { best = S.mesTot[i]; bi = i; }
+          if (worst < 0 || S.mesTot[i] < worst) { worst = S.mesTot[i]; wi = i; }
+        }
+      }
+      txt = 'Entre <b>' + mesLargo(st.a) + '</b> y <b>' + mesLargo(st.b) + '</b> hay <b>' + fmt(tot) + '</b> viajes registrados (≈ ' + fmt(prom) +
+        ' por día con registros). La hora de mayor retiro es <b>' + hh(pico) + '</b>, con ' + pct(S.hora[pico] / tot) + ' del total. ' +
+        'Las 20 estaciones con más retiros reúnen el <b>' + pct(sT20 / tot) + '</b> de los viajes del periodo.';
+      if (nm > 1) {
+        txt += ' El mes de mayor volumen es <b>' + mesLargo(bi) + '</b> (' + fmt(best) + ') y el de menor volumen es <b>' + mesLargo(wi) + '</b> (' + fmt(worst) + ').';
+      }
+    }
+    setHTML('tx_resumen', txt);
+
+    var d = zeros(7), k;
+    for (k = 0; k < 7; k++) { d[k] = S.diaCnt[k] > 0 ? S.diaSum[k] / S.diaCnt[k] : 0; }
+    var dm = argmax(d), dn = 0;
+    for (k = 1; k < 7; k++) { if (d[k] < d[dn]) { dn = k; } }
+    setHTML('tx_demanda', tot ?
+      'En el periodo elegido el día con más viajes por jornada es el <b>' + D.dias[dm] + '</b> (≈ ' + fmt(d[dm]) + ') y el de menos es el <b>' + D.dias[dn] + '</b> (≈ ' + fmt(d[dn]) +
+      '). Los promedios usan solo días con registros, sin imputar ceros.' : '');
+
+    var rk = topEst(S.Et, 15).map(function (e, j) {
+      return [j + 1, D.meta.id[e], D.meta.col[e] || '—', D.meta.alc[e] || '—', fmt(S.Et[e]), pct(S.Et[e] / tot)];
+    });
+    setHTML('tbl_rank', tot ? tabla(['#', 'Estación', 'Colonia', 'Alcaldía', 'Retiros', '% del periodo'], rk) : '');
+
+    var bl = balanceIdx(15).map(function (e) {
+      var b = S.At[e] - S.Et[e], mv = S.At[e] + S.Et[e];
+      return [D.meta.id[e], D.meta.col[e] || '—', fmt(S.Et[e]), fmt(S.At[e]),
+        '<b style="color:' + (b > 0 ? VERDE : CORAL) + '">' + (b > 0 ? '+' : '') + fmt(b) + '</b>', pct(b / mv)];
+    });
+    setHTML('tbl_balance', tot ? tabla(['Estación', 'Colonia', 'Retiros', 'Arribos', 'Balance', 'Desbalance relativo'], bl) : '');
+  }
+
+  /* ---------- Filtro de meses DENTRO de una gráfica ---------- */
+  function dispEn(a, b) { var r = [], i; for (i = a; i <= b; i++) { if (D.disp[i]) { r.push(i); } } return r; }
+
+  function crearFiltro(key, contId, chartId) {
+    var cont = el(contId); if (!cont) { return; }
+    var w = W[key] = { a: D.rango[0], b: D.rango[1], timer: null, previo: null, S: null };
+    var i, ticks = '', sinDatos = [];
+    for (i = 0; i < NM; i++) {
+      var p = D.meses[i].split('-');
+      ticks += '<span title="' + mesLargo(i) + (D.disp[i] ? '' : ' (sin datos)') + '">' + MES_ABR[parseInt(p[1], 10) - 1].charAt(0).toUpperCase() + '</span>';
+      if (!D.disp[i]) { sinDatos.push(mesLab(i)); }
+    }
+    cont.className = 'ctl-box';
+    cont.innerHTML =
+      '<div class="ctl-top"><span class="ctl-p" id="' + key + '_per"></span><span class="ctl-k"><b id="' + key + '_n">0</b> viajes</span></div>' +
+      '<div class="rng"><div class="rng-track"><div class="rng-fill" id="' + key + '_fill"></div></div>' +
+      '<input type="range" id="' + key + '_ra" min="0" max="' + (NM - 1) + '" step="1" value="' + w.a + '" aria-label="Mes inicial">' +
+      '<input type="range" id="' + key + '_rb" min="0" max="' + (NM - 1) + '" step="1" value="' + w.b + '" aria-label="Mes final"></div>' +
+      '<div class="ticks">' + ticks + '</div>' +
+      '<div class="ctl-b"><button type="button" data-p="todo">Todo 2025</button><button type="button" data-p="s1">Ene–Jun</button>' +
+      '<button type="button" data-p="s2">Jul–Dic</button><button type="button" data-p="ult3">Últimos 3</button>' +
+      '<button type="button" class="play" id="' + key + '_play">▶ Mes a mes</button></div>' +
+      (sinDatos.length ? '<div class="ctl-n">Sin datos cargados: ' + sinDatos.join(', ') + '.</div>' : '');
+
+    var ra = el(key + '_ra'), rb = el(key + '_rb'), ts = cont.querySelectorAll('.ticks span');
+
+    function aplicar(sync) {
+      if (sync) { ra.value = w.a; rb.value = w.b; }
+      var den = Math.max(NM - 1, 1), f = el(key + '_fill');
+      f.style.left = (100 * w.a / den) + '%'; f.style.width = (100 * (w.b - w.a) / den) + '%';
+      Array.prototype.forEach.call(ts, function (sp, j) { sp.className = (D.disp[j] ? '' : 'nd') + (j >= w.a && j <= w.b ? ' on' : ''); });
+      w.S = calc(w.a, w.b);
+      setHTML(key + '_per', w.a === w.b ? mesLargo(w.a) : mesLab(w.a) + ' → ' + mesLab(w.b));
+      setHTML(key + '_n', fmt(w.S.total));
+      var ce = el(chartId);
+      if (visible(ce)) { pintar(chartId); } else { pendiente[chartId] = true; }
+    }
+    function detener(restaurar) {
+      if (w.timer) { clearInterval(w.timer); w.timer = null; }
+      el(key + '_play').textContent = '▶ Mes a mes';
+      if (restaurar && w.previo) { w.a = w.previo[0]; w.b = w.previo[1]; aplicar(true); }
+      w.previo = null;
+    }
+    function reproducir() {
+      var d = dispEn(0, NM - 1), k = 0;
+      if (d.length < 2) { return; }
+      w.previo = [w.a, w.b];
+      el(key + '_play').textContent = '■ Detener';
+      function paso() { w.a = d[k]; w.b = d[k]; aplicar(true); k++; if (k >= d.length) { detener(true); } }
+      paso();
+      w.timer = setInterval(paso, 1500);
+    }
+    function preset(p) {
+      var d, a, b;
+      if (p === 'todo') { a = D.rango[0]; b = D.rango[1]; }
+      else if (p === 's1') { d = dispEn(0, 5); if (d.length) { a = d[0]; b = d[d.length - 1]; } }
+      else if (p === 's2') { d = dispEn(6, 11); if (d.length) { a = d[0]; b = d[d.length - 1]; } }
+      else if (p === 'ult3') { d = dispEn(0, NM - 1); if (d.length) { b = d[d.length - 1]; a = d[Math.max(0, d.length - 3)]; } }
+      if (a !== undefined) { w.a = a; w.b = b; aplicar(true); }
+    }
+    ra.addEventListener('input', function () {
+      detener(); var a = parseInt(ra.value, 10), b = parseInt(rb.value, 10);
+      if (a > b) { rb.value = a; b = a; } w.a = a; w.b = b; aplicar(false);
+    });
+    rb.addEventListener('input', function () {
+      detener(); var a = parseInt(ra.value, 10), b = parseInt(rb.value, 10);
+      if (b < a) { ra.value = b; a = b; } w.a = a; w.b = b; aplicar(false);
+    });
+    Array.prototype.forEach.call(cont.querySelectorAll('[data-p]'), function (bt) {
+      bt.addEventListener('click', function () { detener(); preset(bt.getAttribute('data-p')); });
+    });
+    el(key + '_play').addEventListener('click', function () { if (w.timer) { detener(true); } else { reproducir(); } });
+    aplicar(true);
+  }
+
+  /* ---------- Arranque ---------- */
+  function iniciar() {
+    S = calc(st.a, st.b);            // resto del dashboard: todo el periodo cargado
+    actualizarTextos();
+    crearFiltro('top10', 'ctl_top10', 'ch_top10');   // filtro propio de la gráfica "Estaciones con más retiros"
+    refrescar();
+    var id;
+    if ('IntersectionObserver' in window) {
+      var io = new IntersectionObserver(function (ents) {
+        ents.forEach(function (en) {
+          if (en.isIntersecting && en.target.offsetWidth > 0) {
+            var i2 = en.target.id;
+            if (pendiente[i2] || !dibujado[i2]) { pintar(i2); }
+            else { try { Plotly.Plots.resize(en.target); } catch (x) { /* nada */ } }
+          }
+        });
+      });
+      for (id in charts) { if (charts.hasOwnProperty(id) && el(id)) { io.observe(el(id)); } }
+    }
+    window.addEventListener('resize', redimensionar);
+    if (window.jQuery) { window.jQuery(document).on('shown.bs.tab', function () { setTimeout(redimensionar, 60); }); }
+    window.addEventListener('hashchange', function () { setTimeout(redimensionar, 120); });
+    setTimeout(redimensionar, 300);
+    setTimeout(redimensionar, 1200);
+  }
+
+  function arrancar() { setTimeout(iniciar, 80); }
+  if (document.readyState === 'complete') { arrancar(); }
+  else { window.addEventListener('load', arrancar); }
+})();
+
+</script>
