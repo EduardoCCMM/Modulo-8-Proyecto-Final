@@ -7,6 +7,9 @@
 
 **Reporte PDF:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/Reporte_Ecobici_eq9.pdf
 
+**Dashboard:**
+
+Dashboard HTML:**
 ---
 ### Integrantes
 
