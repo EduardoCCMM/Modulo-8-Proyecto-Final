@@ -1,7 +1,5 @@
-# ECOBICI CDMX · 2025
-### Patrones horarios, perfiles de estaciones y presión operativa
-
-**Equipo 9 · Módulo 8 · Proyecto Final**
+# ECOBICI CDMX · 
+### **Equipo 9 · Módulo 8 · Proyecto Final**
 
 **Dashboard publicado:** https://eduardoccmm.github.io/Modulo-8---Proyecto-Final/dashboard_ecobici_2025.html
 **Repositorio:** https://github.com/EduardoCCMM/Modulo-8---Proyecto-Final
