@@ -5,7 +5,7 @@
 
 **Notebook:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/notebook_equipo_final.Rmd
 
-**Reporte PDF:** 
+**Reporte PDF:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/Reporte_Ecobici_eq9.pdf
 
 ---
 ### Integrantes
