@@ -1,5 +1,5 @@
-# ECOBICI CDMX · 
-### **Equipo 9 · Módulo 8 · Proyecto Final**
+# ECOBICI CDMX 
+## **Módulo 8 · Proyecto Final**
 
 **Dashboard publicado:** https://rpubs.com/EliLopez01/1464119
 
