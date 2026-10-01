@@ -2,6 +2,7 @@
 ## **Módulo 8 · Proyecto Final**
 
 **Dashboard publicado:** https://rpubs.com/EliLopez01/1464119
+
 **Notebook:** https://github.com/EduardoCCMM/Modulo-8-Proyecto-Final/blob/main/notebook_equipo_final.Rmd
 
 ---
