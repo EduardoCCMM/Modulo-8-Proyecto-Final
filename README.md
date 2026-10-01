@@ -39,6 +39,7 @@ Para ello se hace lo siguiente:
 | `notebook_equipo_final.Rmd` | Notebook del equipo: obtención, exploración y limpieza de los datos. |
 | `dashboard_ecobici_2025.Rmd` | Código fuente del dashboard (`flexdashboard`). |
 | `dashboard_ecobici_2025.html` | Dashboard ya generado (Knit), listo para abrirse en el navegador. |
+| `Reporte_Ecobici` | Entrega de reporte en PDF. |
 | `README.md` | Este archivo. |
 
 Los **datos no se incluyen** en el repositorio por su tamaño. Hay que descargarlos como se explica abajo.
